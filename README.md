@@ -1,5 +1,77 @@
 # 학습된 MLP의 웨이트를 이해 가능한 형태로 번역하기
 
+---
+
+# 여기부터 보세요
+
+## 1. 명령 하나 — 개념 전체
+
+```bash
+.venv/bin/python scripts/walkthrough.py
+```
+
+유닛 1개에서 시작해 조각 합치기까지 7단계. **모든 숫자가 손으로 검산됩니다.**
+읽는 버전: [`docs/walkthrough_stage1.md`](docs/walkthrough_stage1.md)
+
+| STEP | 무엇을 보이나 | 핵심 한 줄 |
+|---|---|---|
+| 1 | ReLU 유닛 하나 = 칼질 한 번 | `w`가 칼날 방향, `b`가 위치 |
+| 2 | 유닛 2개 = 4조각, 조각마다 행렬 하나 | **ReLU는 `W2`의 열을 골라내는 스위치** |
+| 3 | 유닛 3개 = 8조각이 아니라 7조각 | 기하학적으로 불가능한 코드가 있다 |
+| 4 | 유닛 64개 → 조각 1,378개 (`2^64` 아님) | **`2^h`는 완전히 틀린 직관** |
+| 5 | MNIST에서는 왜 다시 `2^128`인가 | 784차원은 공간이 남아돌아 제약이 사라짐 |
+| 6 | 4조각의 ε-path 전체 (전수 탐색) | **ε 최소화만으로 causal importance가 나옴** |
+| 7 | 세 거리 척도가 다른 답을 준다 | logit이 기준, 나머지는 대리 지표 |
+
+## 2. 그림 다섯 장 — 증거 전체
+
+`artifacts/figures/` (레포에 포함되어 있음, 재생성 불필요)
+
+| 그림 | 무엇을 보여주나 |
+|---|---|
+| `walkthrough_buildup.png` | 유닛 1→64개일 때 평면이 쪼개지는 과정 |
+| `polytopes_moons.png`, `polytopes_spiral.png` | 학습된 모델의 실제 폴리토프 + 첫 층 직선 겹침 + 결정 경계 |
+| `zero_sets_moons.png`, `zero_sets_spiral.png` | 1층 유닛은 전역 직선, 2층 유닛은 꺾인 선 |
+
+## 3. 검증 결과 — 예측을 먼저 적고 맞췄는지
+
+[`docs/stage1_log.md`](docs/stage1_log.md). 예측 6개 전부 PASS.
+
+| | 예측 | 결과 |
+|---|---|---|
+| P1 | 1층 영역 경계는 `W1`의 직선 위에만 있다 | **100.00 %** |
+| P2 | 2층은 그 비율이 낮다 (나머지는 둘째 층 경계) | 51 % / 59 % |
+| P3·P4 | Zaslavsky 상한 / 첫 층 상한과 일치 | 1,326 ≤ 2,081 / 1,881 > 529 |
+| P5 | 영역은 깊이 무관하게 볼록 (784차원 포함) | **위반 0** |
+| P6 | 2층 유닛의 꺾임은 첫 층 직선 위에서만 | **100.00 %** (대조군 대비 15배 분리) |
+
+## 4. 다음에 할 일
+
+[`docs/open_questions.md`](docs/open_questions.md) — 현재 위치, 미결정 D1~D4,
+겪은 실패 L1~L4, 영감 I1~I4, 열린 질문 Q1~Q4.
+
+---
+
+## 나머지 파일은 무엇인가
+
+| | 역할 |
+|---|---|
+| `docs/concepts.md` | 용어 사전 / 정의 모음. **walkthrough를 읽다 막힐 때 찾아보는 용도** |
+| `src/mlpinterp/` | 재사용 모듈. 핵심은 `models.py`의 `effective_affine` (A_r 계산)과 `regions.py` |
+| `scripts/train.py` | 6개 모델 학습 (2D×2 + MNIST, 각각 1층/2층) |
+| `scripts/extract_regions.py` | 활성 패턴 추출 → `artifacts/regions/` |
+| `scripts/viz_polytopes.py` | P1~P4 검증 + 폴리토프 그림 |
+| `scripts/check_depth.py` | P5~P6 검증 + 영점 집합 그림 |
+| `CLAUDE.md` | 작업 규칙. 다음 세션에서 자동으로 읽힘 |
+
+**전부 다시 만들려면:**
+
+```bash
+uv run python scripts/train.py && uv run python scripts/extract_regions.py && uv run python scripts/viz_polytopes.py && uv run python scripts/check_depth.py && uv run python scripts/walkthrough.py
+```
+
+---
+
 ## 목표
 
 MLP는 CNN·Transformer를 포함한 모든 현대 신경망에 들어 있으면서 가장 해석하기 어려운
