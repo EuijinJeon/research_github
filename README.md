@@ -23,6 +23,16 @@
 | 6 | 4조각의 ε-path 전체 (전수 탐색) | **ε 최소화만으로 causal importance가 나옴** |
 | 7 | 세 거리 척도가 다른 답을 준다 | logit이 기준, 나머지는 대리 지표 |
 
+**기호가 헷갈릴 때** — 정의 원본은 [`docs/symbols.md`](docs/symbols.md) 한 곳에 있습니다.
+그리고 HTML 버전을 만들면 **기호에 마우스를 올렸을 때 정의가 뜹니다**:
+
+```bash
+uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_stage1.html
+```
+
+터미널만 볼 때도 각 표 앞에 그 표의 기호 정의가 먼저 출력됩니다.
+문서·HTML 툴팁·터미널 범례 셋 다 `docs/symbols.md` 하나를 읽으므로 정의가 어긋날 수 없습니다.
+
 ## 2. 그림 다섯 장 — 증거 전체
 
 `artifacts/figures/` (레포에 포함되어 있음, 재생성 불필요)

@@ -26,3 +26,6 @@ wandb/
 
 # Stage 2에서 클론할 외부 레포
 external/*/
+
+# build_docs.py가 생성하는 HTML (마크다운에서 언제든 재생성)
+artifacts/docs_html/

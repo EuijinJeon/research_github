@@ -31,6 +31,7 @@ import torch.nn as nn  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mlpinterp.models import MLP  # noqa: E402
+from mlpinterp.symbols import legend  # noqa: E402
 from mlpinterp.train import load_model  # noqa: E402
 from mlpinterp.utils import FIG_DIR, ensure_dirs, setup_matplotlib  # noqa: E402
 
@@ -196,6 +197,7 @@ def step3() -> None:
 def step4(model: MLP) -> list[tuple[int, int]]:
     head(4, "유닛을 늘리며 조각 수 세기 — 실측 vs 2^h vs 공식")
 
+    legend("h", "d", "2^h", "1+h+C(h,2)", "일반위치")
     print("  실제 학습된 moons h=[64] 모델의 첫 층에서, 앞에서부터 h개 유닛만 켜고 센다.")
     print("  격자 1200x1200, 범위 ±3.5 (상자 안에서 센 값이라 이론값보다 작을 수 있다).")
     print()
@@ -237,6 +239,7 @@ def step4(model: MLP) -> list[tuple[int, int]]:
 def step5() -> None:
     head(5, "그런데 MNIST 에서는 왜 2^128 이 되는가")
 
+    legend("d", "h", "C(h, i)", "R", "N", "R/N")
     print("  공식:  조각 수 <= sum_{i=0}^{d} C(h, i)     (d = 입력 차원, h = 유닛 수)")
     print()
     print(f"  {'세팅':>22s} {'d':>5s} {'h':>5s} {'상한':>22s}")
@@ -276,6 +279,7 @@ def _partitions(items: list[int]):
 def step6() -> None:
     head(6, "조각을 합쳐보기 — 4조각짜리 신경망의 ε-path 전체를 손으로")
 
+    legend("K", "\u03a9", "\u03b5", "\u03b5-path", "A_r", "b_r", "centroid")
     model = toy_model()
 
     # 상자 안을 훑어 4조각과 각 조각의 (A_r, b_r), 점 개수를 얻는다
@@ -373,6 +377,7 @@ def step6() -> None:
 def step7() -> None:
     head(7, "'비슷하다'를 어떻게 재는가 — 세 척도가 서로 다른 답을 준다")
 
+    legend("Frobenius", "cosine", "logit \uac70\ub9ac", "[A_r | b_r]")
     print("  출력 1개, 입력 2차원인 조각 세 개를 상상하자 (b는 전부 0으로 둔다):")
     print()
     A0 = torch.tensor([10.0, 0.0])
