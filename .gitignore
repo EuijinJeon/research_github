@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 데이터셋 원본은 재다운로드 가능하므로 추적하지 않는다
+data/
+
+# 중간 산출물 정책
+#
+# 추적함:
+#   checkpoints/ (668K) — 맥에서 재학습 없이 바로 분석에 들어갈 수 있어야 한다.
+#                          같은 가중치를 쓰는 것이 두 머신의 결과를 비교하는 전제이기도 하다.
+#   figures/     (3.3M) — docs가 참조한다.
+#
+# 추적 안 함:
+#   regions/     (20M)  — 체크포인트에서 수십 초면 재생성된다 (extract_regions.py).
+#                          용량 대비 이득이 없다.
+artifacts/regions/*.pt
+artifacts/logs/*
+!artifacts/**/.gitkeep
+
+# wandb offline run 디렉토리
+wandb/
+
+# Stage 2에서 클론할 외부 레포
+external/*/

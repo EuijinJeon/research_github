@@ -1,0 +1,32 @@
+[project]
+name = "mlpinterp"
+version = "0.1.0"
+description = "학습된 MLP의 웨이트를 이해 가능한 형태로 번역하기 — polytope 분해 / 파라미터 분해 프로토콜"
+readme = "README.md"
+# 3.12로 고정: 연구 레포(param-decomp 등)와 과학계산 스택 휠 가용성이 가장 안정적인 버전.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # torch/torchvision은 기본 PyPI 인덱스에서 받는다.
+    # linux x86_64 -> CUDA 번들 휠, macOS arm64 -> MPS 지원 휠이 자동으로 잡히므로
+    # pyproject에 CUDA 인덱스를 박지 않는 편이 4060/M4 Pro 양쪽에 모두 안전하다.
+    "torch>=2.6",
+    "torchvision>=0.21",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "matplotlib>=3.9",
+    "tqdm>=4.66",
+    "einops>=0.8",
+    "wandb>=0.18",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ipykernel>=6.29"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlpinterp"]
