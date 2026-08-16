@@ -70,17 +70,26 @@ def step1() -> None:
 # ================================================================ STEP 2
 
 
-def step2() -> None:
-    head(2, "유닛 2개 = 4조각. 각 조각에서 신경망은 서로 다른 '하나의 행렬'")
+def toy_model() -> MLP:
+    """STEP 2~6에서 계속 쓰는 4조각짜리 장난감 신경망.
 
-    torch.manual_seed(0)
+    손으로 검산할 수 있게 가중치를 직접 박는다.
+        W1 = [[1,0],[0,1]]   b1 = [-0.5,-0.5]   -> 경계 x1=0.5, x2=0.5
+        W2 = [[2,3]]         b2 = [1.0]
+    """
     model = MLP(in_dim=2, hidden=[2], out_dim=1)
-    # 손으로 검산할 수 있게 가중치를 직접 박는다.
     with torch.no_grad():
         model.layers[0].weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
         model.layers[0].bias.copy_(torch.tensor([-0.5, -0.5]))
         model.layers[1].weight.copy_(torch.tensor([[2.0, 3.0]]))
         model.layers[1].bias.copy_(torch.tensor([1.0]))
+    return model
+
+
+def step2() -> None:
+    head(2, "유닛 2개 = 4조각. 각 조각에서 신경망은 서로 다른 '하나의 행렬'")
+
+    model = toy_model()
 
     print("  W1 = [[1, 0],     b1 = [-0.5, -0.5]      유닛0 경계: x1 = 0.5")
     print("        [0, 1]]                            유닛1 경계: x2 = 0.5")
@@ -249,6 +258,179 @@ def step5() -> None:
     print("    K = 60,000 이라는 뜻이고, 여기서 K를 줄일 수 있는지가 실질적 질문이다.")
 
 
+# ================================================================ STEP 6
+
+
+def _partitions(items: list[int]):
+    """집합의 모든 분할을 생성한다. 원소 4개면 15가지 (벨 수 B4=15)."""
+    if not items:
+        yield []
+        return
+    first, rest = items[0], items[1:]
+    for p in _partitions(rest):
+        for i in range(len(p)):
+            yield p[:i] + [[first] + p[i]] + p[i + 1 :]
+        yield [[first]] + p
+
+
+def step6() -> None:
+    head(6, "조각을 합쳐보기 — 4조각짜리 신경망의 ε-path 전체를 손으로")
+
+    model = toy_model()
+
+    # 상자 안을 훑어 4조각과 각 조각의 (A_r, b_r), 점 개수를 얻는다
+    g = torch.linspace(-2.0, 3.0, 400)
+    gy, gx = torch.meshgrid(g, g, indexing="ij")
+    X = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
+    with torch.no_grad():
+        y_true = model(X).squeeze(1)
+        pat = model.activation_pattern(X)
+    uniq, inv = torch.unique(pat, dim=0, return_inverse=True)
+    R = uniq.shape[0]
+    A, b = model.effective_affine(uniq)  # (R,1,2), (R,1)
+
+    print(f"  상자 [-2,3]^2 를 400x400 격자로 훑음. 조각 {R}개.")
+    print(f"  출력 범위: {y_true.min():.2f} ~ {y_true.max():.2f}\n")
+    print(f"  {'조각':>10s} {'코드':>8s} {'A_r':>12s} {'b_r':>7s} {'점 개수':>8s}")
+    for r in range(R):
+        cnt = int((inv == r).sum())
+        code = "".join(str(int(v)) for v in uniq[r])
+        print(f"  {r:>10d} {code:>8s} {str([round(v,1) for v in A[r,0].tolist()]):>12s}"
+              f" {b[r,0].item():7.2f} {cnt:8,d}")
+
+    print()
+    print("  '합친다' = 여러 조각이 하나의 (A, b)를 공유하게 만드는 것.")
+    print("  대표값은 두 가지로 만들 수 있고, 둘은 다른 답을 준다:")
+    print("    (a) centroid  : 합칠 조각들의 [A|b]를 점 개수로 가중평균")
+    print("    (b) 최소제곱  : 합친 점들에 대해 A·x+b 를 직접 최소제곱 피팅")
+    print()
+
+    # ---- 각 K에 대해 '모든 분할'을 훑어 최적 분할을 찾는다 (R=4라 15가지뿐)
+    def err_of(partition, mode: str) -> float:
+        pred = torch.empty_like(y_true)
+        for block in partition:
+            mask = torch.isin(inv, torch.tensor(block))
+            if mode == "centroid":
+                w = torch.tensor([float((inv == r).sum()) for r in block])
+                w = w / w.sum()
+                Ab = (w[:, None] * A[block, 0]).sum(0)  # (2,)
+                bb = (w * b[block, 0]).sum()
+            else:  # 최소제곱
+                Xs = X[mask]
+                ys = y_true[mask]
+                M = torch.cat([Xs, torch.ones(len(Xs), 1)], dim=1)  # (n,3)
+                sol = torch.linalg.lstsq(M, ys.unsqueeze(1)).solution.squeeze(1)
+                Ab, bb = sol[:2], sol[2]
+            pred[mask] = X[mask] @ Ab + bb
+        return (pred - y_true).abs().mean().item()
+
+    all_parts = list(_partitions(list(range(R))))
+    print(f"  조각이 {R}개뿐이라 가능한 분할 {len(all_parts)}가지를 '전부' 훑어")
+    print(f"  각 K마다 진짜 최적 분할을 찾을 수 있다.\n")
+    print(f"  {'K':>3s} {'ε (centroid)':>14s} {'ε (최소제곱)':>14s}   최적 분할 (centroid 기준)")
+    for K in range(R, 0, -1):
+        cands = [p for p in all_parts if len(p) == K]
+        best = min(cands, key=lambda p: err_of(p, "centroid"))
+        e_c = err_of(best, "centroid")
+        best_ls = min(cands, key=lambda p: err_of(p, "lstsq"))
+        e_l = err_of(best_ls, "lstsq")
+        shown = " | ".join("".join(str(i) for i in sorted(bl)) for bl in sorted(best, key=min))
+        print(f"  {K:3d} {e_c:14.4f} {e_l:14.4f}   {shown}")
+
+    print()
+    print("  ★ 최적 분할을 읽어보자 — 이게 이 STEP에서 가장 재미있는 부분이다.")
+    print("      K=2 의 최적 분할은  {0,2} | {1,3}  이다.")
+    print("      조각 0=00, 2=10 은 '유닛1이 꺼진' 것들이고,")
+    print("      조각 1=01, 3=11 은 '유닛1이 켜진' 것들이다.")
+    print("      즉 최적 분할은 '유닛1의 상태'로 묶었다. 유닛0의 상태는 무시했다.")
+    print()
+    print("      왜? W2 = [2, 3] 이라 유닛1의 가중치(3)가 유닛0(2)보다 크기 때문이다.")
+    print("      유닛0을 틀리는 비용보다 유닛1을 틀리는 비용이 크다.")
+    print("      그래서 '유닛0은 뭉개도 되고 유닛1은 구분해야 한다'가 최적이 된다.")
+    print()
+    print("      ★★ 이게 바로 'causal importance'의 가장 단순한 형태다.")
+    print("         우리는 중요도를 손으로 정의한 적이 없는데, 그냥 ε을 최소화했더니")
+    print("         알고리즘이 '더 중요한 유닛'을 알아서 찾아냈다.")
+    print("         Stage 2의 SPD가 학습으로 하려는 일이 개념적으로 이것이다.")
+    print()
+    print("  읽는 법:")
+    print("    K=4 -> ε=0. 당연하다. 안 합쳤으니 원본과 완전히 같다.")
+    print("    K를 줄일수록 ε이 커진다. 이 표가 바로 ε-path 다.")
+    print("    최소제곱이 centroid보다 항상 낫거나 같다 — 점들에 직접 맞추니까.")
+    print("    ★ 그런데 centroid 가 '[A|b]를 클러스터링한다'는 우리 얘기와 맞는 방식이다.")
+    print("      최소제곱은 A_r 을 아예 안 쓰고 (x, f(x)) 만 쓴다 — 그건 다른 문제다.")
+    print("      우리는 '파라미터를 합친다'를 하려는 것이므로 centroid 쪽이 맞다.")
+    print()
+    print("  ★★ 결정적으로 중요한 한계: 여기서는 분할 15가지를 '전부' 훑었다.")
+    print("     조각이 60,000개면 분할의 수가 우주의 원자 수를 아득히 넘는다.")
+    print("     실제로는 greedy(agglomerative)로 근사할 수밖에 없고,")
+    print("     따라서 우리가 그릴 ε-path 는 '진짜 최적'보다 위에 있는 상계다.")
+
+
+# ================================================================ STEP 7
+
+
+def step7() -> None:
+    head(7, "'비슷하다'를 어떻게 재는가 — 세 척도가 서로 다른 답을 준다")
+
+    print("  출력 1개, 입력 2차원인 조각 세 개를 상상하자 (b는 전부 0으로 둔다):")
+    print()
+    A0 = torch.tensor([10.0, 0.0])
+    Ac = torch.tensor([1.0, 0.0])
+    Ad = torch.tensor([7.07, 7.07])
+    fmt = lambda t: str([round(v, 2) for v in t.tolist()])  # noqa: E731
+    print(f"    기준  A  = {fmt(A0):>14s}")
+    print(f"    후보  C  = {fmt(Ac):>14s}   <- A와 '방향'이 완전히 같다 (둘 다 x1축)")
+    print(f"    후보  D  = {fmt(Ad):>14s}   <- A와 '크기'가 같다 (노름 10), 방향은 45도")
+    print()
+    print("  질문: A 에 더 가까운 것은 C 인가 D 인가?")
+    print()
+
+    def cos_dist(u, v):
+        return 1 - (u @ v / (u.norm() * v.norm())).item()
+
+    print(f"  {'척도':>28s} {'A~C':>10s} {'A~D':>10s}   더 가까운 쪽")
+    fc, fd = (A0 - Ac).norm().item(), (A0 - Ad).norm().item()
+    print(f"  {'Frobenius (성분 차이)':>28s} {fc:10.3f} {fd:10.3f}   {'C' if fc < fd else 'D'}")
+    cc, cd = cos_dist(A0, Ac), cos_dist(A0, Ad)
+    print(f"  {'cosine (방향 차이)':>28s} {cc:10.3f} {cd:10.3f}   {'C' if cc < cd else 'D'}")
+    print()
+    print("  ★ 벌써 답이 갈린다. Frobenius는 D, cosine은 C 라고 한다.")
+    print("    cosine 입장에서 C는 A와 '거리 0' 이다 — 방향이 똑같으니까.")
+    print("    Frobenius 입장에서 C는 A와 9만큼 떨어져 있다 — 크기가 10배 다르니까.")
+    print()
+    print("  그럼 logit 거리는? 이건 '실제로 출력이 얼마나 다른가'를 잰다.")
+    print("  그런데 이 값은 데이터가 어디 있느냐에 따라 달라진다:")
+    print()
+
+    dists = {
+        "데이터가 x1축 위 (1,0)": torch.tensor([[1.0, 0.0]]),
+        "데이터가 x2축 위 (0,1)": torch.tensor([[0.0, 1.0]]),
+        "데이터가 대각선 (0.7,0.7)": torch.tensor([[0.707, 0.707]]),
+    }
+    print(f"  {'데이터 분포':>28s} {'A~C':>10s} {'A~D':>10s}   더 가까운 쪽")
+    for label, xs in dists.items():
+        lc = ((xs @ (A0 - Ac)).abs()).mean().item()
+        ld = ((xs @ (A0 - Ad)).abs()).mean().item()
+        print(f"  {label:>28s} {lc:10.3f} {ld:10.3f}   {'C' if lc < ld else 'D'}")
+
+    print()
+    print("  ★★ 데이터가 x2축 위에 있으면 A와 C는 출력이 '완전히 같다' (거리 0).")
+    print("     x1 성분이 다른데도 상관없다 — 데이터에 x1 성분이 없으니까.")
+    print("     반대로 x1축 위에 있으면 A와 C가 가장 멀다.")
+    print("     같은 세 행렬인데 데이터 분포가 답을 뒤집는다.")
+    print()
+    print("  그래서 세 척도는 이렇게 정리된다:")
+    print("    Frobenius : 파라미터가 얼마나 다른가.        분포 무관. 계산 쌈.")
+    print("    cosine    : 판단 '방향'이 얼마나 다른가.     크기를 버림. 분포 무관.")
+    print("    logit     : 실제 행동이 얼마나 다른가.       분포 의존. 우리 목표와 일치.")
+    print()
+    print("  ★ 우리 문제 설정은 err(⟦P⟧, f_θ) ≤ ε 이다. 이 err 이 곧 행동 차이다.")
+    print("    따라서 '옳은' 거리는 logit 거리이고, 나머지 둘은 계산이 싼 대리 지표다.")
+    print("    Stage 1에서 셋을 다 재보는 이유: 대리 지표가 얼마나 쓸 만한지 알아야")
+    print("    MNIST 규모에서 무엇을 쓸지 정할 수 있기 때문이다.")
+
+
 # ================================================================ 그림
 
 
@@ -319,6 +501,8 @@ def main() -> None:
     model, _ = load_model("moons", [64], 0, device="cpu")
     step4(model)
     step5()
+    step6()
+    step7()
 
     out = buildup_figure(model)
     print(f"\n{RULE}\n그림 저장: {out}\n{RULE}")
