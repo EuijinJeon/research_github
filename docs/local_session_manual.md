@@ -33,17 +33,17 @@ GitHub 원격 세션은 egress 프록시 뒤에 있고, **논문 호스트가 �
 
 ## 1. 로컬에서 이 문서를 못 찾을 때 ★
 
-**이 문서와 `docs/prior_work.md`는 `main`에 없다.**
-`claude/research-status-check-vpg4bl` 브랜치에만 있다.
-로컬에서 `main`을 보고 있으면 파일이 안 보이는 게 정상이다.
-
-원격 상태 (2026-08-19 기준):
+**2026-08-19 이후로는 `main`에 있다.** `git pull origin main` 이면 된다.
 
 ```
 origin  https://github.com/EuijinJeon/research_github
-  refs/heads/main                                c70b865   (2026-08-17, 문서 없음)
-  refs/heads/claude/research-status-check-vpg4bl 46198d9   (2026-08-19, 여기 있음)
+  refs/heads/main                                1fa302f   (2026-08-19, 문서 포함)
+  refs/heads/claude/research-status-check-vpg4bl 1fa302f   (같은 커밋)
 ```
+
+그래도 파일이 안 보인다면 로컬이 옛 커밋(`c70b865`, 2026-08-17)에 머물러 있는 것이다.
+**한 번 겪은 실패라 절차를 남겨둔다** — 처음엔 이 문서가 브랜치에만 있었고,
+로컬에서 `main`을 보고 있어서 파일을 못 찾았다.
 
 ### 진단 — 위에서부터 순서대로
 
@@ -61,12 +61,13 @@ cd research_github
 # (3) 브랜치가 안 보일 때 — 원격 목록을 먼저 갱신한다
 git remote -v                     # origin 이 위 URL 과 같은지 확인
 git fetch origin                  # ← 브랜치 하나가 아니라 전부 받는다
-git branch -r                     # origin/claude/research-status-check-vpg4bl 이 보여야 함
-git switch claude/research-status-check-vpg4bl
+git switch main && git pull origin main
+#   (작업 브랜치를 직접 보고 싶으면)
+#   git switch claude/research-status-check-vpg4bl
 
 # (4) 확인
 ls docs/prior_work.md docs/local_session_manual.md
-git log --oneline -1              # 46198d9 여야 함
+git log --oneline -1              # 1fa302f 이상이어야 함
 ```
 
 > `git fetch origin <브랜치명>` 만 하면 원격추적 참조가 안 생기는 경우가 있어
@@ -79,16 +80,6 @@ git log --oneline -1              # 46198d9 여야 함
 - 인증을 물어보면 레포가 private 이라서다. `gh auth login` 또는 PAT 로 로그인.
 - **레포 자체를 새로 받는 게 제일 빠를 때가 많다** — 추적되는 건 코드·문서·체크포인트뿐이고
   `artifacts/regions/`(20M)는 어차피 `extract_regions.py` 로 수십 초면 재생성된다.
-
-### 브랜치 말고 `main`에서 보고 싶다면
-
-작업이 끝났다고 판단되면 병합한다. **먼저 사용자 확인을 받을 것.**
-
-```bash
-git switch main && git pull origin main
-git merge claude/research-status-check-vpg4bl
-git push origin main
-```
 
 ### 환경
 
