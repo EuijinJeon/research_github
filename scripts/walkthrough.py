@@ -11,6 +11,14 @@ docs/walkthrough_stage1.md 와 짝을 이룬다. 문서를 읽으며 이걸 실�
   STEP 3  유닛 3개 = 8조각이 아니라 7조각. 불가능한 코드 찾기
   STEP 4  유닛을 늘리며 조각 수 세기: 실측 vs 2^h vs 공식
   STEP 5  왜 MNIST에서는 2^128 이 되는가
+  STEP 6  4조각 ε-path 전체를 전수탐색으로 (+ centroid vs refit)
+  STEP 7  '비슷하다'를 재는 세 척도가 서로 다른 답을 준다
+  STEP 8  네 번째 척도(부호벡터 해밍) — 가장 싸지만 유닛 중요도를 못 본다
+  STEP 9  절편 가중치 λ 는 자유 손잡이가 아니다 — greedy 를 깨뜨린다
+  STEP 10 앵커: 클러스터링 코드가 정답을 복원하는가 (+ 확률적 선택 γ=0.2)
+  STEP 11 대조군: 랜덤 배정을 이기는가 (dense/chance 종점)
+  STEP 12 조견표는 'k=1' 이다 — 4조각은 유닛 기여 2개가 만든 것
+  STEP 13 깊이가 합성성을 깨뜨린다 (MNIST 1층 vs 2층) — Stage 2 의 존재 이유
   그림    artifacts/figures/walkthrough_buildup.png
 """
 
@@ -30,6 +38,7 @@ import torch.nn as nn  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from mlpinterp.data import get_dataset  # noqa: E402
 from mlpinterp.models import MLP  # noqa: E402
 from mlpinterp.symbols import legend  # noqa: E402
 from mlpinterp.train import load_model  # noqa: E402
@@ -40,6 +49,546 @@ RULE = "─" * 74
 
 def head(n: int, title: str) -> None:
     print(f"\n{RULE}\nSTEP {n}  {title}\n{RULE}")
+
+
+# ================================================================ STEP 0
+#
+# 문제 정의. STEP 1 이전에 "무엇을 / 왜 / 어떤 파라미터로" 를 세워둔다.
+# 이 절이 없으면 STEP 1~4의 '평면·직선·칼질' 어휘가 일반적 서술로 오해되고,
+# STEP 5에서 d=784를 만났을 때 쌓아온 직관이 무너진다.
+
+
+def _count_regions_exact(W: torch.Tensor, b: torch.Tensor) -> int:
+    """초평면 배치가 만드는 영역 수를 '정확히' 센다 (d=1,2,3 공용).
+
+    방법: 가능한 부호벡터 2^h 개를 전부 훑으며 각각이 실현 가능한지 LP로 판정한다.
+    STEP 3에서 손으로 '(0,0,1)은 모순이라 불가능'을 보인 것과 같은 판정을 기계가 한다.
+
+    ⚠️ 처음에는 난수 샘플링으로 셌는데 d=2에서 16이 나와야 할 자리에 14가 나왔다.
+       상자를 키워도 16 → 15 → 14 로 오락가락했다. 잘린 게 아니라 얇은 영역을
+       난수가 놓친 것이었다. '실측이 공식보다 작으면 상자 탓'이라는 설명이
+       항상 맞는 게 아니라는 뜻이라 판정 자체를 정확한 방법으로 바꿨다.
+    """
+    from itertools import product
+
+    import numpy as np
+    from scipy.optimize import linprog
+
+    Wn = W.numpy().astype(float)
+    bn = b.numpy().astype(float)
+    h, d = Wn.shape
+    n_ok = 0
+    for signs in product([0, 1], repeat=h):
+        # 변수 [x (d개), t]. 부등식 s_i·(w_i·x + b_i) ≥ t 를 만족하며 t를 최대화한다.
+        # 최적 t > 0 이면 '두께가 있는' 영역이 실제로 존재한다는 뜻.
+        s = np.where(np.array(signs) > 0, 1.0, -1.0)
+        res = linprog(
+            c=np.concatenate([np.zeros(d), [-1.0]]),
+            A_ub=np.hstack([-(s[:, None] * Wn), np.ones((h, 1))]),
+            b_ub=s * bn,
+            bounds=[(-50, 50)] * d + [(0, 1)],
+            method="highs",
+        )
+        if res.status == 0 and -res.fun > 1e-9:
+            n_ok += 1
+    return n_ok
+
+
+def _pad(s: str, width: int, right: bool = False) -> str:
+    """터미널 표시폭 기준으로 채운다.
+
+    한글은 터미널에서 2칸을 차지하는데 파이썬 format은 1칸으로 세어 열이 밀린다.
+    한글이 섞인 표에서는 이 보정이 없으면 표가 읽히지 않는다.
+    """
+    from unicodedata import east_asian_width
+
+    disp = sum(2 if east_asian_width(ch) in "WF" else 1 for ch in s)
+    fill = " " * max(width - disp, 0)
+    return fill + s if right else s + fill
+
+
+# 0-3의 표와 그림이 '같은 배치'를 써야 한다. 이 seed는 임의로 고른 게 아니라,
+# 교점이 전부 원점 근처(반경 1.5 안)에 모여 상자 하나에 16조각이 다 들어오는 것을
+# 골랐다. seed=7은 두 직선이 거의 평행해 교점이 x=9.9까지 뻗어서, 그림에
+# 조각 14개만 보이는데 표에는 16이라 적히는 어긋남이 생겼다.
+DIM_SEED = 39
+
+
+def _general_position(h: int, d: int, seed: int = DIM_SEED) -> tuple[torch.Tensor, torch.Tensor]:
+    """일반위치에 가까운 초평면 h개. 절편을 0에서 떨어뜨려 동시교차를 피한다."""
+    gen = torch.Generator().manual_seed(seed)
+    W = torch.randn(h, d, generator=gen)
+    W = W / W.norm(dim=1, keepdim=True)
+    b = torch.randn(h, generator=gen) * 0.6
+    return W, b
+
+
+def step0_task(models: dict) -> None:
+    head(0, "문제 정의 — 무엇을, 왜, 어떤 파라미터로 뜯어보는가")
+
+    print("  [0-1] 우리가 뜯어볼 함수는 어디서 오는가")
+    print()
+    print("  해석하려면 먼저 '해석당할 함수'가 있어야 한다. 그래서 MLP를 학습시킨다.")
+    print("  ★ 핵심: 우리는 이 태스크를 잘 푸는 게 목적이 아니다.")
+    print("    태스크는 '뜯어볼 함수를 만들어내는 도구'일 뿐이다. 그래서 일부러")
+    print("    이미 잘 풀리는 쉬운 문제를 골랐다 — 문제가 어려우면 나중에")
+    print("    '모델이 못 배운 것'과 '우리 설명이 실패한 것'이 뒤섞이기 때문이다.")
+    print()
+    cols = [("태스크", 9), ("입력 x", 27), ("정답 y", 20), ("d", 5), ("N(train)", 10)]
+    print("  " + "".join(_pad(c, w) for c, w in cols) + _pad("test acc", 9, right=True))
+    for key, (model, ds, acc) in models.items():
+        xin = {
+            "moons": "평면 위의 점 (x₁, x₂)",
+            "spiral": "평면 위의 점 (x₁, x₂)",
+            "mnist": "28×28 이미지를 편 784벡터",
+        }[ds.name]
+        yout = {
+            "moons": "초승달 2개 중 하나",
+            "spiral": "나선 팔 3개 중 하나",
+            "mnist": "숫자 10개 중 하나",
+        }[ds.name]
+        cells = [key, xin, yout, str(ds.input_dim), f"{len(ds.x_train):,}"]
+        print(
+            "  " + "".join(_pad(v, w) for v, (_, w) in zip(cells, cols))
+            + _pad(f"{acc:.4f}", 9, right=True)
+        )
+    print()
+    print("  세 태스크가 서로 다른 역할을 맡는다:")
+    print("    moons  — 경계가 매끄러운 곡선 하나. 적은 조각으로 근사될 것 같은 쪽.")
+    print("    spiral — 경계가 여러 번 감긴다. 많은 조각을 강제하는 쪽. moons와 대조.")
+    print("    mnist  — d=784. '2차원이라서 됐던 것'이 아님을 확인하는 쪽.")
+
+
+def step0_params(models: dict) -> None:
+    print()
+    print(RULE)
+    print("  [0-2] 파라미터 — 각 기호가 무엇이고 무엇을 정하는가")
+    print(RULE)
+    legend("d", "h", "W1", "b1", "W2", "b2", "A_r", "b_r", "N")
+    print("  1 hidden layer MLP:")
+    print()
+    print("      z = W1·x + b1        (h개 유닛의 pre-activation)")
+    print("      a = ReLU(z)          (음수를 0으로)")
+    print("      f = W2·a  + b2       (C_out개 클래스의 logit)")
+    print()
+
+    m2, ds2, _ = models["moons"]
+    keys = ["moons"] + (["mnist"] if "mnist" in models else [])
+    hdr = "".join(_pad(f"{k} h={models[k][0].hidden}", 16, right=True) for k in keys)
+    print("  " + _pad("기호", 11) + _pad("정체", 26) + _pad("shape", 13) + hdr)
+
+    def row(sym, what, shape, vals):
+        print(
+            "  " + _pad(sym, 11) + _pad(what, 26) + _pad(shape, 13)
+            + "".join(_pad(v, 16, right=True) for v in vals)
+        )
+
+    def shp(t) -> str:
+        return str(tuple(t.shape))
+
+    row("d", "입력 차원", "—", [str(models[k][1].input_dim) for k in keys])
+    row("h", "hidden 유닛 수", "—", [str(sum(models[k][0].hidden)) for k in keys])
+    row("C_out", "출력 차원 (클래스 수)", "—", [str(models[k][1].n_classes) for k in keys])
+    row("W1", "첫 층 가중치", "(h, d)", [shp(models[k][0].layers[0].weight) for k in keys])
+    row("b1", "첫 층 절편", "(h,)", [shp(models[k][0].layers[0].bias) for k in keys])
+    row("W2", "출력층 가중치", "(C_out, h)", [shp(models[k][0].layers[-1].weight) for k in keys])
+    row("b2", "출력층 절편", "(C_out,)", [shp(models[k][0].layers[-1].bias) for k in keys])
+    row("θ", "전체 파라미터 개수", "—",
+        [f"{sum(p.numel() for p in models[k][0].parameters()):,}" for k in keys])
+    row("N", "학습 데이터 개수", "—", [f"{len(models[k][1].x_train):,}" for k in keys])
+    print("  " + "─" * 72)
+    row("A_r", "영역 r의 유효 선형맵", "(C_out, d)",
+        [f"({models[k][1].n_classes}, {models[k][1].input_dim})" for k in keys])
+    row("b_r", "영역 r의 유효 절편", "(C_out,)", [f"({models[k][1].n_classes},)" for k in keys])
+    row("[A_r|b_r]", "증강 행렬 = 조견표 한 줄", "(C_out, d+1)",
+        [f"{models[k][1].n_classes*(models[k][1].input_dim+1):,}개 숫자" for k in keys])
+
+    print()
+    print("  ★ 각 파라미터가 '무엇을 정하는가' — 이게 STEP 1~2의 예고편이다:")
+    print("      W1의 한 행 w_i  ->  유닛 i가 긋는 칼날의 '방향' (초평면의 법선)")
+    print("      b1의 한 성분    ->  그 칼날의 '위치' (원점에서 얼마나 밀려났나)")
+    print("      h              ->  칼질 횟수. 공간을 몇 번 자르는가")
+    print("      W2             ->  '켜진 유닛들'을 어떻게 섞어 최종 출력을 만드는가")
+    print("      d              ->  ★ 같은 h로 몇 조각이 나오는지를 정한다 (0-3)")
+    print()
+    print("  ★★ [A_r|b_r] 줄을 주목. MNIST에서 조견표 한 줄이 7,850개 숫자다.")
+    print("     원본 파라미터가 101,770개인데 조견표가 60,000줄이면 4.7억 개 —")
+    print("     원본보다 4,600배 크다. '설명'이라 부를 수 없다. 이게 Stage 1의 출발점이다.")
+
+
+def step0_dimension() -> None:
+    print()
+    print(RULE)
+    print("  [0-3] 왜 하필 2차원인가 — 편의가 아니라 실험 설계다")
+    print(RULE)
+    legend("d", "h", "C(h, i)", "1 + h + C(h, 2)", "2^h")
+    print("  초평면 h개가 d차원 공간을 몇 조각으로 자르는가 (Zaslavsky):")
+    print()
+    print("      조각 수  ≤  Σ_{i=0}^{min(d,h)} C(h, i)")
+    print()
+    print("  합의 '위 끝'이 d 라는 데 전부가 걸려 있다.")
+    print("  ★ 초평면 5개를 '똑같이' 두고 d만 바꿔보자. 코드는 셋 다 5비트다.")
+    print()
+    h = 5
+    shapes = {1: "직선 위의 '점'", 2: "평면 위의 '직선'", 3: "공간 속의 '평면'"}
+    dcols = [("d", 4), ("초평면의 모습", 20), ("2^h", 6), ("공식", 30), ("공식값", 8),
+             ("실측 (LP 전수판정)", 20)]
+    print("  " + "".join(_pad(c, w) for c, w in dcols))
+    for d in (1, 2, 3):
+        W, b = _general_position(h, d)
+        got = _count_regions_exact(W, b)
+        terms = "1 + " + " + ".join(f"C(5,{i})" for i in range(1, d + 1))
+        formula = sum(comb(h, i) for i in range(d + 1))
+        cells = [str(d), shapes[d], str(2**h), terms, str(formula), str(got)]
+        print("  " + "".join(_pad(v, w) for v, (_, w) in zip(cells, dcols)))
+    print()
+    print("  ★ 셋 다 '코드는 5비트, 2^h = 32가지'로 똑같다. 그런데 실제 영역은 6 / 16 / 26.")
+    print("    코드 길이(h)가 아니라 d 가 영역 수를 정한다.")
+    print("    d가 1 늘 때마다 합에 항이 하나씩 붙기 때문이다.")
+    print("    그리고 d ≥ h 가 되면 합이 끝까지 가서 Σ_i C(h,i) = 2^h — 상한이 무너진다.")
+    print("    (실측은 부호벡터 32가지를 LP로 하나씩 판정한 값이다. 공식과 정확히 일치한다.)")
+    print()
+    print("  ★ d=2 가 우리에게 해주는 세 가지:")
+    print("     (1) 그릴 수 있다.     폴리토프를 종이에 그려서 눈으로 검산할 수 있다.")
+    print("     (2) 끊긴다.           합이 세 항(i=0,1,2)에서 멈춰 h의 2차식이 된다.")
+    print("                           h=64 여도 조각이 2,081개뿐 — 전부 열거 가능하다.")
+    print("     (3) 비교할 수 있다.   '샘플링으로 본 영역'과 '실제 존재하는 영역 전체'를")
+    print("                           직접 대조할 수 있는 유일한 세팅이다.")
+    print()
+    print("  d=784 에서는 셋 다 깨진다. 그릴 수 없고, 상한이 2^128 이고, 열거가 불가능하다.")
+    print()
+    print("  ★★ 그래서 앞으로 이 문서가 '직선', '평면', '칼질', '조각'이라고 쓰면")
+    print("     그건 전부 d=2 에서만 통하는 말이다. 일반형은 '초평면'과 '영역'이다.")
+    print("     STEP 1~4는 d=2 세계이고, STEP 5에서 이 가정을 일부러 깬다.")
+
+
+def step0_objective() -> None:
+    print()
+    print(RULE)
+    print("  [0-4] 우리가 재는 두 숫자 — Ω 와 ε")
+    print(RULE)
+    legend("Ω", "ε", "K", "ε-path", "P", "⟦P⟧", "err")
+    print("  프로젝트 전체가 푸는 문제는 한 줄이다:")
+    print()
+    print("      P* = argmin Ω(P)      s.t.   err(⟦P⟧, f_θ) ≤ ε")
+    print()
+    print("  말로: '오차 ε까지 봐준다고 할 때, 이 신경망의 가장 단순한 설명은")
+    print("        무엇이고 그 단순함은 얼마인가?'")
+    print()
+    print("  Stage 1은 설명 P를 '구역별 조견표'로 고정한다:")
+    print()
+    print("      입력 x -> x가 속한 구역 k를 찾는다 -> 그 줄의 A_k·x + b_k 를 계산한다")
+    print()
+    for sym, what in [
+        ("P", "조견표 (K줄, 각 줄이 [A_k|b_k])"),
+        ("Ω(P)", "K — 조견표의 줄 수. ★ 이걸 최소화한다"),
+        ("ε", "합친 조견표와 원본 f_θ의 출력 차이"),
+        ("k(x)", "x가 어느 줄인지. ← 이건 아직 원본 신경망이 알려준다"),
+    ]:
+        print("  " + _pad(sym, 8) + what)
+    print()
+    print("  K를 줄이면 ε이 커진다. 그 맞바꿈 곡선이 ε-path 이고, 그게 산출물이다.")
+    print("  ★ 이 문서(STEP 1~7)는 그 곡선을 그리기 위한 재료를 하나씩 쌓는 과정이다.")
+
+
+# ---------------------------------------------------------------- 그림 ①
+
+
+def task_figure(models: dict) -> Path:
+    """우리가 뜯어볼 함수 3개를 눈으로. '입력이 뭐고 출력이 뭔가'를 먼저 보여준다."""
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4.2))
+
+    m_moons, ds_moons, _ = models["moons"]
+    m_spiral, ds_spiral, _ = models["spiral"]
+
+    # (a) 입력 데이터 자체 — 아직 모델 이야기가 아니다
+    ax = axes[0]
+    xs = ds_moons.x_train.numpy()
+    ys = ds_moons.y_train.numpy()
+    for c, col in zip(range(2), ["#4C72B0", "#DD8452"]):
+        m = ys == c
+        ax.scatter(xs[m, 0], xs[m, 1], s=4, c=col, label=f"정답 y = {c}", alpha=0.75)
+    # 한글 폰트에 아래첨자 글리프가 없어 x₁ 이 두부로 깨진다. mathtext 로 그린다.
+    ax.set_xlabel("$x_1$")
+    ax.set_ylabel("$x_2$")
+    ax.legend(markerscale=3, fontsize=9, loc="upper right")
+    ax.set_title(
+        "(a) 태스크 moons — 입력과 정답\n입력 x = 평면 위의 점 $(x_1, x_2)$,  d = 2",
+        fontsize=10,
+    )
+
+    # (b),(c) 학습이 끝난 f_θ — 이것이 '해석당할 함수'
+    # 배경(모델의 예측)과 점(정답)을 같은 컬러맵·같은 스케일로 칠한다.
+    # 서로 다른 맵을 쓰면 '이 색 영역 = 이 클래스'라는 대응이 안 읽힌다.
+    lim, res = 3.5, 400
+    g = torch.linspace(-lim, lim, res)
+    gy, gx = torch.meshgrid(g, g, indexing="ij")
+    grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
+    for ax, (mdl, ds, acc), tag in [
+        (axes[1], models["moons"], "(b)"),
+        (axes[2], models["spiral"], "(c)"),
+    ]:
+        with torch.no_grad():
+            pred = mdl(grid).argmax(1).reshape(res, res).numpy()
+        ax.imshow(
+            pred, origin="lower", extent=(-lim, lim, -lim, lim),
+            cmap="tab10", vmin=0, vmax=9, alpha=0.30, interpolation="nearest",
+        )
+        xs, ys = ds.x_train.numpy(), ds.y_train.numpy()
+        ax.scatter(xs[:, 0], xs[:, 1], s=2.5, c=ys, cmap="tab10", vmin=0, vmax=9, alpha=0.9)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(
+            f"{tag} 학습된 $f_θ$ — {ds.name} h={mdl.hidden}\n"
+            f"{sum(mdl.hidden)}유닛, test {acc:.3f}.  ★ 이 함수를 뜯는다",
+            fontsize=10,
+        )
+
+    # (d) MNIST — 입력이 784차원이라 (b),(c)처럼 그릴 수 없다는 것이 요점
+    ax = axes[3]
+    if "mnist" in models:
+        _, ds_m, acc_m = models["mnist"]
+        tiles = ds_m.x_train[:9].reshape(9, 28, 28).numpy()
+        mont = np.vstack([np.hstack(tiles[i * 3 : i * 3 + 3]) for i in range(3)])
+        # 표준화된 값이라 극단 픽셀 몇 개가 범위를 늘려 흐릿해진다. 분위수로 자른다.
+        ax.imshow(
+            mont, cmap="gray_r", interpolation="nearest",
+            vmin=np.percentile(mont, 2), vmax=np.percentile(mont, 99.5),
+        )
+        for k in (28, 56):
+            ax.axhline(k - 0.5, color="w", lw=1.5)
+            ax.axvline(k - 0.5, color="w", lw=1.5)
+        ax.set_title(
+            f"(d) 태스크 MNIST — d = 784\n"
+            f"test {acc_m:.3f}.  ★ 입력이 784차원이라 (b),(c)처럼 못 그린다",
+            fontsize=10,
+        )
+    else:
+        ax.text(0.5, 0.5, "MNIST 없음\n(python scripts/train.py)", ha="center", va="center")
+        ax.set_title("(d) 태스크: MNIST", fontsize=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    fig.suptitle(
+        "STEP 0-1  우리가 '해석'할 대상은 이 함수들이다\n"
+        "태스크를 잘 푸는 것이 목적이 아니라, 뜯어볼 함수를 얻는 것이 목적이다",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    out = FIG_DIR / "step0_task.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+# ---------------------------------------------------------------- 그림 ②
+
+
+def _draw_layer(ax, x, n_show, n_real, label, color, y_span=2.6):
+    """세로로 늘어선 노드 한 층. n_real이 크면 가운데를 '생략 점 3개'로 대신한다.
+
+    ⋮ (U+22EE) 는 한글 폰트에 글리프가 없어 두부로 깨진다. 직접 찍는다.
+    """
+    ys = np.linspace(y_span / 2, -y_span / 2, n_show)
+    for i, y in enumerate(ys):
+        if n_real > n_show and i == n_show // 2:
+            for dy in (-0.13, 0.0, 0.13):
+                ax.plot([x], [y + dy], marker="o", ms=2.6, color="#555", zorder=3)
+            continue
+        ax.add_patch(plt.Circle((x, y), 0.16, fc=color, ec="#333", lw=1.0, zorder=3))
+    ax.text(x, -y_span / 2 - 0.42, label, ha="center", va="top", fontsize=10)
+    return ys
+
+
+def architecture_figure(models: dict) -> Path:
+    """파라미터가 어디에 붙어 있는지. shape을 그림 위에 직접 적는다."""
+    keys = ["moons"] + (["mnist"] if "mnist" in models else [])
+    fig, axes = plt.subplots(1, len(keys), figsize=(7.5 * len(keys), 5.4))
+    if len(keys) == 1:
+        axes = [axes]
+
+    for ax, key in zip(axes, keys):
+        mdl, ds, _ = models[key]
+        d, h, c = ds.input_dim, sum(mdl.hidden), ds.n_classes
+        x_in, x_hd, x_ou = 0.0, 2.2, 4.4
+        ax.set_xlim(-0.95, 5.35)
+        ax.set_ylim(-3.05, 2.5)
+        ax.set_aspect("equal")  # 없으면 노드가 원이 아니라 타원으로 찌그러진다
+        ax.axis("off")
+
+        yin = _draw_layer(ax, x_in, min(d, 5), d, f"입력 x\nd = {d}", "#BBD5EA")
+        yhd = _draw_layer(ax, x_hd, min(h, 7), h, f"ReLU 유닛\nh = {h}", "#F3C77B")
+        you = _draw_layer(ax, x_ou, min(c, 5), c, f"출력 logit\nC_out = {c}", "#A8D5A2")
+
+        for xa, xb, ya, yb in [(x_in, x_hd, yin, yhd), (x_hd, x_ou, yhd, you)]:
+            for a in ya:
+                for b_ in yb:
+                    ax.plot([xa, xb], [a, b_], color="#999", lw=0.35, alpha=0.5, zorder=1)
+
+        for xm, txt, note in [
+            (
+                (x_in + x_hd) / 2,
+                f"W1  ({h}, {d})\nb1  ({h},)",
+                "각 행 $w_i$ = 초평면의 '방향'\n$b1$ 성분 = 그 '위치'",
+            ),
+            (
+                (x_hd + x_ou) / 2,
+                f"W2  ({c}, {h})\nb2  ({c},)",
+                "켜진 유닛의 열만\n살아남는다 (STEP 2)",
+            ),
+        ]:
+            ax.text(xm, 1.72, txt, ha="center", va="bottom", fontsize=11,
+                    color="#B5471B", weight="bold")
+            ax.text(xm, -2.42, note, ha="center", va="top", fontsize=9, color="#444")
+        n_par = sum(p.numel() for p in mdl.parameters())
+        ax.set_title(
+            f"{ds.name}  hidden={mdl.hidden}   (θ 총 {n_par:,}개)\n"
+            f"영역 하나의 조견표 줄 [A_r|b_r] = ({c}, {d + 1}) = {c * (d + 1):,}개 숫자",
+            fontsize=11,
+        )
+
+    fig.suptitle(
+        "STEP 0-2  파라미터가 어디에 붙어 있는가\n"
+        "W1·b1 이 공간을 자르고, W2·b2 가 살아남은 유닛을 섞는다",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    out = FIG_DIR / "step0_architecture.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+# ---------------------------------------------------------------- 그림 ③
+
+
+def dimension_figure() -> Path:
+    """같은 초평면 5개가 d=1,2,3 에서 몇 조각을 만드는가 + 성장 곡선."""
+    h = 5
+    fig = plt.figure(figsize=(14, 8.6))
+
+    # (a) d=1 : 직선 위의 점 5개 -> 6조각
+    ax = fig.add_subplot(2, 3, 1)
+    W1d, b1d = _general_position(h, 1)
+    n1 = _count_regions_exact(W1d, b1d)
+    xlim1 = 1.6
+    cuts = np.sort((-b1d / W1d[:, 0]).numpy())
+    edges = np.concatenate([[-xlim1], cuts, [xlim1]])
+    cols = plt.get_cmap("turbo")(np.linspace(0.08, 0.92, len(edges) - 1))
+    for i in range(len(edges) - 1):
+        ax.axvspan(edges[i], edges[i + 1], ymin=0.42, ymax=0.58, color=cols[i])
+    for cpt in cuts:
+        ax.plot([cpt, cpt], [0.34, 0.66], color="k", lw=2.2)
+    ax.set_xlim(-xlim1, xlim1)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([])
+    ax.set_xlabel("$x_1$")
+    ax.set_title(f"d = 1 :  초평면 = '점'\n점 5개 → 조각 {n1}개", fontsize=11)
+
+    # (b) d=2 : 평면 위의 직선 5개 -> 16조각
+    ax = fig.add_subplot(2, 3, 2)
+    lim, res = 2.6, 1400
+    W2d, b2d = _general_position(h, 2)
+    n2 = _count_regions_exact(W2d, b2d)
+    g = torch.linspace(-lim, lim, res)
+    gy, gx = torch.meshgrid(g, g, indexing="ij")
+    pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
+    code = ((pts @ W2d.T + b2d) > 0).to(torch.uint8)
+    uniq, inv = torch.unique(code, dim=0, return_inverse=True)
+    cols = plt.get_cmap("turbo")(np.linspace(0.05, 0.95, uniq.shape[0]))
+    np.random.default_rng(1).shuffle(cols)
+    ax.imshow(
+        cols[inv.reshape(res, res).numpy()],
+        origin="lower", extent=(-lim, lim, -lim, lim), interpolation="nearest",
+    )
+    t = np.linspace(-lim * 2, lim * 2, 4)
+    for i in range(h):
+        w0, w1 = W2d[i].tolist()
+        if abs(w1) > abs(w0):
+            ax.plot(t, -(w0 * t + b2d[i].item()) / w1, color="k", lw=1.4)
+        else:
+            ax.plot(-(w1 * t + b2d[i].item()) / w0, t, color="k", lw=1.4)
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("$x_1$")
+    ax.set_ylabel("$x_2$")
+    ax.set_title(
+        f"d = 2 :  초평면 = '직선'   ★ STEP 1~4가 사는 곳\n직선 5개 → 조각 {n2}개",
+        fontsize=11,
+    )
+
+    # (c) d=3 : 공간 속의 평면 5개 -> 26조각
+    ax = fig.add_subplot(2, 3, 3, projection="3d")
+    W3d, b3d = _general_position(h, 3)
+    n3 = _count_regions_exact(W3d, b3d)
+    span = np.linspace(-3, 3, 2)
+    P, Q = np.meshgrid(span, span)
+    for i in range(h):
+        w = W3d[i].numpy()
+        bb = b3d[i].item()
+        k = int(np.argmax(np.abs(w)))
+        axis = [0, 1, 2]
+        axis.remove(k)
+        coords = [None, None, None]
+        coords[axis[0]], coords[axis[1]] = P, Q
+        coords[k] = -(w[axis[0]] * P + w[axis[1]] * Q + bb) / w[k]
+        ax.plot_surface(*coords, alpha=0.30, color=plt.get_cmap("turbo")(i / h), lw=0)
+    ax.set_xlim(-3, 3)
+    ax.set_ylim(-3, 3)
+    ax.set_zlim(-3, 3)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.set_title(f"d = 3 :  초평면 = '평면'\n평면 5개 → 조각 {n3}개", fontsize=11)
+
+    # (d) 성장 곡선 — 여기가 이 그림의 결론
+    ax = fig.add_subplot(2, 1, 2)
+    hs = np.arange(1, 129)
+    for d, style, col in [
+        (1, "-", "#6BAED6"), (2, "-", "#B5471B"), (3, "-", "#74A97B"),
+        (784, "--", "#555555"),
+    ]:
+        vals = [sum(comb(int(hh), i) for i in range(min(d, int(hh)) + 1)) for hh in hs]
+        lab = f"d = {d}" + ("   ← 2D 합성 (STEP 1~4)" if d == 2 else "")
+        lab += "   ← MNIST. 2^h 와 같아진다 (STEP 5)" if d == 784 else ""
+        ax.plot(hs, vals, style, color=col, lw=2.2 if d in (2, 784) else 1.4, label=lab)
+    ax.axvline(64, color="#B5471B", lw=0.8, ls=":", alpha=0.7)
+    ax.axvline(128, color="#555555", lw=0.8, ls=":", alpha=0.7)
+    ax.annotate(
+        "h=64, d=2\n조각 2,081개\n(열거 가능)",
+        xy=(64, 2081), xytext=(70, 3e6), fontsize=9.5, color="#B5471B",
+        arrowprops=dict(arrowstyle="->", color="#B5471B", lw=1.2),
+    )
+    # 위첨자 유니코드(10³⁸)는 한글 폰트에 글리프가 없어 두부로 깨진다. mathtext 로.
+    ax.annotate(
+        "h=128, d=784\n조각 $3.4\\times10^{38}$개\n(원천 불가능)",
+        xy=(128, 2.0**128), xytext=(74, 1e30), fontsize=9.5, color="#333",
+        arrowprops=dict(arrowstyle="->", color="#333", lw=1.2),
+    )
+    ax.set_yscale("log")
+    ax.set_xlabel("h  (ReLU 유닛 = 초평면의 개수)")
+    ax.set_ylabel("영역 수 상한  (로그 눈금)")
+    ax.set_title(
+        "같은 h 라도 d 가 영역 수를 정한다 — 이것이 '2차원을 고른' 이유다",
+        fontsize=11.5,
+    )
+    ax.legend(fontsize=9.5, loc="upper left")
+    ax.grid(alpha=0.25, which="both")
+
+    fig.suptitle(
+        "STEP 0-3  왜 하필 2차원인가\n"
+        "d=2 는 편의가 아니라 실험 설계다: 그릴 수 있고, 공식이 h² 에서 끊기고, 전부 셀 수 있다",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    out = FIG_DIR / "step0_dimension.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out
 
 
 # ================================================================ STEP 1
@@ -361,9 +910,26 @@ def step6() -> None:
     print("    K=4 -> ε=0. 당연하다. 안 합쳤으니 원본과 완전히 같다.")
     print("    K를 줄일수록 ε이 커진다. 이 표가 바로 ε-path 다.")
     print("    최소제곱이 centroid보다 항상 낫거나 같다 — 점들에 직접 맞추니까.")
-    print("    ★ 그런데 centroid 가 '[A|b]를 클러스터링한다'는 우리 얘기와 맞는 방식이다.")
-    print("      최소제곱은 A_r 을 아예 안 쓰고 (x, f(x)) 만 쓴다 — 그건 다른 문제다.")
-    print("      우리는 '파라미터를 합친다'를 하려는 것이므로 centroid 쪽이 맞다.")
+    print()
+    print("  ⚠️ 여기 원래 이렇게 적혀 있었다 — 그리고 그 판단은 2026-08-19 에 뒤집혔다:")
+    print('      "최소제곱은 A_r 을 안 쓰고 (x, f(x)) 만 쓴다 — 그건 다른 문제다.')
+    print('       우리는 파라미터를 합치려는 것이므로 centroid 쪽이 맞다."')
+    print()
+    print("    선행연구 원문을 읽고 나서 알게 된 것: **최소제곱이 곧 refit 이고,**")
+    print("    affine map 을 클러스터링한 유일한 선행연구(Aletheia)가 바로 그걸 한다.")
+    print("    논문 Algorithm 1 의 마지막 단계가 '클러스터마다 GLM 을 다시 적합' 이다.")
+    print("    즉 최소제곱은 '다른 문제'가 아니라 **이 분야의 표준 절차**였다.")
+    print()
+    print("    두 방식의 관계를 정확히 적으면 이렇다:")
+    print("      centroid : 대표값을 [A_r|b_r] '들'로부터 만든다.  파라미터만 쓴다.")
+    print("      refit    : 대표값을 그 클러스터의 (x, f(x)) 로부터 다시 적합한다.")
+    print("      → 어느 쪽이 '맞다'가 아니라, **둘은 서로 다른 손잡이**다.")
+    print("        클러스터링(어느 조각을 묶나)과 대표값 만들기(묶고 나서 뭘 쓰나)는 별개다.")
+    print("        우리 Ω = K 정의에는 후자가 안 들어 있다 — 그래서 공짜처럼 보이지만 아니다.")
+    print()
+    print("    → 방침: **refit 있음/없음 두 곡선을 나란히 그린다.** 하나를 고르지 않는다.")
+    print("      (한때 'MNIST 는 영역당 1점이라 refit 불가' 라고 적었던 것도 틀렸다.")
+    print("       refit 은 영역이 아니라 클러스터 단위라, K=100 이면 클러스터당 600점이다.)")
     print()
     print("  ★★ 결정적으로 중요한 한계: 여기서는 분할 15가지를 '전부' 훑었다.")
     print("     조각이 60,000개면 분할의 수가 우주의 원자 수를 아득히 넘는다.")
@@ -436,6 +1002,806 @@ def step7() -> None:
     print("    MNIST 규모에서 무엇을 쓸지 정할 수 있기 때문이다.")
 
 
+# ================================================================ STEP 8
+#
+# 2026-08-19 선행연구 원문 확인으로 추가된 절.
+# polytope lens 원문에서 Frobenius 는 각주의 지나가는 제안일 뿐이었고,
+# 그들이 실제로 쓴 것은 '부호벡터 위의 해밍 거리' 였다. 척도가 넷이 됐다.
+
+
+def _toy_pieces() -> tuple:
+    """STEP 6과 똑같은 4조각을 뽑아 (코드, A, b, 점, 조각라벨) 로 돌려준다.
+
+    STEP 8~11이 전부 이 넷을 공유하므로 한 곳에서 만든다.
+    """
+    model = toy_model()
+    g = torch.linspace(-2.0, 3.0, 400)
+    gy, gx = torch.meshgrid(g, g, indexing="ij")
+    X = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
+    with torch.no_grad():
+        y = model(X).squeeze(1)
+        pat = model.activation_pattern(X)
+    uniq, inv = torch.unique(pat, dim=0, return_inverse=True)
+    A, b = model.effective_affine(uniq)          # (R,1,2), (R,1)
+    return uniq, A[:, 0], b[:, 0], X, y, inv     # A:(R,2)  b:(R,)
+
+
+def _piece_table(codes, A, b, inv) -> None:
+    print(f"  {'조각':>6s} {'코드 r':>8s} {'A_r':>14s} {'b_r':>8s} {'점 개수':>9s}")
+    for r in range(len(codes)):
+        code = "".join(str(int(v)) for v in codes[r])
+        av = "[" + ", ".join(f"{v:.0f}" for v in A[r].tolist()) + "]"
+        print(f"  {r:>6d} {code:>8s} {av:>14s} {b[r].item():8.1f} {int((inv==r).sum()):9,d}")
+
+
+# ---- 네 가지 척도. 전부 '조각 두 개 -> 실수 하나' 로 통일한다 ----------
+
+
+def _d_hamming(codes, A, b, X, y, inv, i, j, lam=1.0) -> float:
+    """부호벡터 r 끼리 다른 비트 수. [A|b] 를 만들 필요조차 없다 — 가장 싸다."""
+    return float((codes[i] != codes[j]).sum())
+
+
+def _d_euclid(codes, A, b, X, y, inv, i, j, lam=1.0) -> float:
+    """증강행렬 [A_r | lam*b_r] 의 유클리드 거리. 출력이 1개라 Frobenius 와 같은 값."""
+    u = torch.cat([A[i], lam * b[i : i + 1]])
+    v = torch.cat([A[j], lam * b[j : j + 1]])
+    return (u - v).norm().item()
+
+
+def _d_cosine(codes, A, b, X, y, inv, i, j, lam=1.0) -> float:
+    """A_r 의 방향 차이. 크기와 절편을 통째로 버린다."""
+    u, v = A[i], A[j]
+    if u.norm() < 1e-9 or v.norm() < 1e-9:
+        return 1.0                                # 영벡터는 방향이 없다
+    return 1.0 - (u @ v / (u.norm() * v.norm())).item()
+
+
+def _d_logit(codes, A, b, X, y, inv, i, j, lam=1.0) -> float:
+    """두 조각의 '실제 출력 차이'. 그 두 조각에 속한 점들 위에서만 잰다."""
+    m = (inv == i) | (inv == j)
+    xs = X[m]
+    dA, db = A[i] - A[j], b[i] - b[j]
+    return (xs @ dA + db).abs().mean().item()
+
+
+METRICS = [
+    ("해밍 (부호벡터 r)", _d_hamming),
+    ("유클리드 ([A|b])", _d_euclid),
+    ("cosine (A 방향)", _d_cosine),
+    ("logit (실제 출력)", _d_logit),
+]
+
+
+def step8() -> None:
+    head(8, "척도가 넷이 됐다 — 그리고 가장 싼 것이 가장 중요한 것을 못 본다")
+
+    legend("A_r", "b_r", "r", "[A_r | b_r]", "K", "ε")
+    codes, A, b, X, y, inv = _toy_pieces()
+    R = len(codes)
+
+    print("  STEP 6의 그 4조각을 그대로 쓴다. 이번엔 '어느 둘이 가까운가'만 본다.\n")
+    _piece_table(codes, A, b, inv)
+    print()
+    print("  STEP 7에서 척도가 셋이라고 했다. 2026-08-19 선행연구 원문 확인에서")
+    print("  네 번째가 나왔다 — polytope lens 가 실제로 쓴 것은 Frobenius 가 아니라")
+    print("  **부호벡터 r 위의 해밍 거리** 였다 (Frobenius 는 각주의 지나가는 제안이었다).")
+    print("  해밍은 [A_r|b_r] 를 만들 필요조차 없어 넷 중 가장 싸다. MNIST에서 특히 그렇다.")
+    print()
+
+    # ---- 쌍거리 표 ----
+    pairs = [(i, j) for i in range(R) for j in range(i + 1, R)]
+    print(f"  {'척도':>20s} " + " ".join(f"{f'{i}-{j}':>7s}" for i, j in pairs) + "   최근접쌍")
+    nearest = {}
+    for name, fn in METRICS:
+        vals = [fn(codes, A, b, X, y, inv, i, j) for i, j in pairs]
+        lo = min(vals)
+        tie = [f"{i}{j}" for (i, j), v in zip(pairs, vals) if abs(v - lo) < 1e-9]
+        nearest[name] = tie
+        print(f"  {name:>20s} " + " ".join(f"{v:7.3f}" for v in vals)
+              + f"   {'/'.join(tie)}")
+    print()
+    print("  ★ 해밍 줄을 보라. 1.000 이 네 번 나온다 — 네 쌍이 전부 동점이다.")
+    print("    (0,1) (0,2) (1,3) (2,3) 이 구별되지 않는다.")
+    print("    유닛0을 뒤집든 유닛1을 뒤집든 '비트 하나'로 똑같이 세기 때문이다.")
+    print()
+    # ---- 진짜 질문: 척도가 '옳은 분할'을 고르는가 ----
+    print("  " + "-" * 70)
+    print("  그런데 최근접쌍은 중간 결과일 뿐이다. 진짜 질문은 이것이다:")
+    print("    '이 척도로 묶으면 STEP 6의 전수탐색 최적 {0,2}|{1,3} 이 나오는가?'")
+    print()
+    print("  ⚠️ 여기서 한 번 틀렸다. 남겨둘 가치가 있는 실패다.")
+    print("     처음에 블록 비용을 '블록 안 쌍거리의 평균'으로 잡고 블록마다 더했다.")
+    print("     그랬더니 넷 다 1+3 분할(예: 0 | 123)을 골랐다 — 척도와 무관하게.")
+    print("     이유: 홑원소 블록은 쌍이 없어 비용이 그냥 0 이다.")
+    print("     즉 '조각 하나를 떼어내고 나머지를 다 뭉치기'가 언제나 공짜로 싸 보인다.")
+    print("     척도의 성질이 아니라 **비용함수의 결함**이었다.")
+    print()
+    print("  고친 방법: 블록당 (쌍거리제곱의 합 ÷ 블록 크기) 를 쓴다.")
+    print("    이건 K-means 목적함수(블록 중심까지의 제곱거리 합)와 정확히 같은 값이고,")
+    print("    항등식  Σ_{i<j} d²_ij / n_b  =  Σ_i ‖x_i − 중심‖²  로 쌍거리만으로 계산된다.")
+    print("    → 거리만 있으면 되므로 **해밍·cosine·logit 에도 그대로 쓸 수 있다.**")
+    print("      (K-means 자체는 유클리드 전용이지만, 이 '값'은 척도를 안 가린다.)")
+    print("    블록이 커지면 나누는 n_b 보다 쌍의 수가 빨리 늘어 비용이 제대로 오른다.")
+    print()
+
+    parts2 = _k_partitions(list(range(R)), 2)
+
+    def metric_cost(partition, fn) -> float:
+        """블록당 쌍거리제곱합 / 블록크기. 블록 중심까지의 제곱거리 합과 같다."""
+        tot = 0.0
+        for blk in partition:
+            if len(blk) < 2:
+                continue
+            ds = [fn(codes, A, b, X, y, inv, i, j) ** 2
+                  for a, i in enumerate(blk) for j in blk[a + 1:]]
+            tot += sum(ds) / len(blk)
+        return tot
+
+    def eps_centroid(partition) -> float:
+        """STEP 6과 같은 방식: 대표값 = 점 개수 가중평균, ε = 평균 절대오차."""
+        pred = torch.empty_like(y)
+        for blk in partition:
+            m = torch.isin(inv, torch.tensor(blk))
+            w = torch.tensor([float((inv == r).sum()) for r in blk])
+            w = w / w.sum()
+            Ab = (w[:, None] * A[blk]).sum(0)
+            bb = (w * b[blk]).sum()
+            pred[m] = X[m] @ Ab + bb
+        return (pred - y).abs().mean().item()
+
+    shown = lambda p: " | ".join("".join(str(i) for i in bl)  # noqa: E731
+                                for bl in sorted(p, key=min))
+    eps = {shown(p): eps_centroid(p) for p in parts2}
+    best_eps = min(eps, key=eps.get)
+
+    hdr = f"  {'K=2 분할':>10s} {'진짜 ε':>9s}"
+    for name, _ in METRICS:
+        hdr += f" {name.split()[0]:>9s}"
+    print(hdr)
+    costs = {name: {shown(p): metric_cost(p, fn) for p in parts2}
+             for name, fn in METRICS}
+    for p in sorted(parts2, key=lambda q: eps[shown(q)]):
+        k = shown(p)
+        row = f"  {k:>10s} {eps[k]:9.4f}"
+        for name, _ in METRICS:
+            row += f" {costs[name][k]:9.3f}"
+        print(row + ("   <- 진짜 최적" if k == best_eps else ""))
+    print()
+    print(f"  진짜 최적(ε 최소)은 {best_eps} 이다. STEP 6의 전수탐색 결과와 같다.")
+    print("  (1+3 분할 네 개의 ε 이 전부 같은 값인 것은 이 장난감이 대칭이라 그렇다.)")
+    print()
+    print(f"  {'척도':>20s} {'고른 분할':>16s} {'맞았나':>7s}   비고")
+    verdict = {}
+    for name, _ in METRICS:
+        c = costs[name]
+        lo = min(c.values())
+        picks = sorted([k for k, v in c.items() if abs(v - lo) < 1e-9])
+        ok = (len(picks) == 1 and picks[0] == best_eps)
+        verdict[name] = ok
+        note = "" if len(picks) == 1 else f"{len(picks)}개 동점 — 고르지 못한다"
+        print(f"  {name:>20s} {'/'.join(picks):>16s} {'O' if ok else 'X':>7s}   {note}")
+    print()
+    print("  ★ 예측 P7 이 맞았다. 해밍은 {0,2}|{1,3} 과 {0,1}|{2,3} 에 **똑같은 값**을 준다.")
+    print("    두 분할 다 '한 비트로 가르기' 라서, 어느 비트인지를 구별할 수단이 없다.")
+    print("    해밍이 보는 것은 부호벡터뿐이고, W2 = [2,3] 은 부호벡터에 안 들어 있다.")
+    print()
+    print("    이게 왜 중요한가: STEP 6의 ★★ 는 '중요도를 정의한 적 없는데 ε 최소화만으로")
+    print("    유닛1이 더 중요하다는 게 나왔다' 였다. 그 발견은 **W2 를 보는 척도에서만** 나온다.")
+    print("    → 해밍은 넷 중 가장 싸지만, 정확히 그 성질을 잃는다.")
+    print("      MNIST 에서 싸다는 이유로 해밍을 고르면 무엇을 포기하는지가 이것이다.")
+    print()
+    print("  ★★ 덤으로 나온 것: cosine 도 틀린다 — 그것도 동점이 아니라 확실하게.")
+    print("     cosine 은 절편 b_r 을 통째로 버리고 A_r 의 방향만 본다.")
+    print("     조각 0 의 A_r = [0,0] 은 방향이 아예 없어서(영벡터) 거리가 정의되지 않는다.")
+    print("     실모델에서도 A_r 이 작은 조각마다 같은 일이 생긴다.")
+    print()
+    print("  정리:")
+    print("    유클리드 · logit : 진짜 최적을 고른다.  (logit 은 ε 과 단위가 같으니 당연)")
+    print("    해밍             : 고르지 못한다 (동점).  가장 싸지만 유닛 중요도를 못 본다.")
+    print("    cosine           : 틀린 것을 고른다.     절편을 버리는 대가.")
+    print("    → 대리 지표로 쓸 만한 것은 **유클리드 하나**다. 이게 D1 의 첫 실측 답이다.")
+
+
+def _k_partitions(items: list[int], k: int) -> list[list[list[int]]]:
+    """원소를 정확히 k개 블록으로 나누는 모든 분할. R=4, k=2 면 7가지."""
+    return [p for p in _partitions(items) if len(p) == k]
+
+
+def _agglomerative(codes, A, b, X, y, inv, fn, lam=1.0, linkage="average",
+                   stop_k=2) -> tuple:
+    """계층 병합. 매 단계 가장 가까운 블록 쌍을 합친다.
+
+    STEP 9~11이 공유한다. 반환: (stop_k 시점의 분할, 병합 이력)
+    이력의 각 항목은 (합친 뒤 블록 수, 합쳐진 조각들, 그때의 거리).
+    """
+    blocks = [[i] for i in range(len(codes))]
+    hist, out = [], None
+    while len(blocks) > 1:
+        best = None
+        for p in range(len(blocks)):
+            for q in range(p + 1, len(blocks)):
+                ds = [fn(codes, A, b, X, y, inv, i, j, lam)
+                      for i in blocks[p] for j in blocks[q]]
+                d = sum(ds) / len(ds) if linkage == "average" else min(ds)
+                if best is None or d < best[0] - 1e-12:
+                    best = (d, p, q)
+        d, p, q = best
+        merged = sorted(blocks[p] + blocks[q])
+        blocks = [bl for k, bl in enumerate(blocks) if k not in (p, q)] + [merged]
+        hist.append((len(blocks), merged, d))
+        if len(blocks) == stop_k:
+            out = [sorted(bl) for bl in blocks]
+    return out, hist
+
+
+def _show(part) -> str:
+    """분할을 '02 | 13' 꼴 문자열로."""
+    return " | ".join("".join(str(i) for i in sorted(bl))
+                      for bl in sorted(part, key=min))
+
+
+
+# ================================================================ STEP 9
+#
+# Aletheia 논문 §5.1 은 "계수와 절편의 유클리드 거리" 라고만 쓴다 — 가중치가 없다.
+# 구현체에만 all_bias_weight 라는 미문서화 손잡이가 있었다.
+# 그러면 그 손잡이를 돌리면 무슨 일이 생기는가? 여기서 직접 돌려본다.
+
+
+def step9() -> None:
+    head(9, "절편 가중치 λ 는 자유 손잡이가 아니다 — 돌리면 앵커가 깨진다")
+
+    legend("[A_r | b_r]", "b_r", "K", "ε")
+    codes, A, b, X, y, inv = _toy_pieces()
+    R = len(codes)
+    pairs = [(i, j) for i in range(R) for j in range(i + 1, R)]
+
+    print("  거리를 [A_r | b_r] 위에서 잰다고 했다. 그런데 A 와 b 는 단위가 다르다.")
+    print("  A 성분이 크면 b 차이가 거리에서 사라진다 — 교훈 L2 에서 피하려던 바로 그 문제다.")
+    print("  그래서 절편에 가중치를 걸 수 있다:  [A_r | λ·b_r].")
+    print()
+    print("  ⚠️ 출처를 정확히 해두자. **λ 는 Aletheia 논문에 없다.**")
+    print("     논문 §5.1 은 '계수와 절편의 유클리드 거리' 라고만 쓰고 가중치도 표준화도")
+    print("     언급하지 않는다. λ 는 구현체(all_bias_weight)에만 있는 미문서화 손잡이다.")
+    print("     → λ=1 이 '선행연구 재현' 이고, λ≠1 은 **우리 추가분**이다.")
+    print()
+    print("  손으로 먼저 적어보자. 조각 넷의 [A|b] 차이는 이렇다:\n")
+    print(f"  {'쌍':>5s} {'ΔA':>10s} {'Δb':>7s}   d² = ‖ΔA‖² + λ²·Δb²")
+    for i, j in pairs:
+        dA = A[i] - A[j]
+        db = (b[i] - b[j]).item()
+        na = (dA @ dA).item()
+        av = "[" + ", ".join(f"{v:.0f}" for v in dA.tolist()) + "]"
+        print(f"  {f'{i}-{j}':>5s} {av:>10s} {db:7.1f}   d² = {na:5.2f} + {db*db:.2f}·λ²")
+    print()
+    print("  이 여섯 줄만 보면 교차점을 손으로 풀 수 있다:")
+    print("    (0,2) 와 (1,2):   4 + 1.00·λ²  =  13 + 0.25·λ²   ->  λ² = 12,  λ = 3.464")
+    print("    (0,1) 과 (1,2):   9 + 2.25·λ²  =  13 + 0.25·λ²   ->  λ² =  2,  λ = 1.414")
+    print()
+    print("  즉 λ 를 키우면 어느 순간 순위가 뒤집힌다. 정말 그런지 훑어보자.\n")
+
+    lams = [0.0, 0.5, 1.0, 1.4, 1.5, 2.0, 3.0, 3.4, 3.5, 5.0, 10.0]
+    parts2 = _k_partitions(list(range(R)), 2)
+    shown = lambda p: " | ".join("".join(str(i) for i in bl)  # noqa: E731
+                                for bl in sorted(p, key=min))
+
+    def wcss(partition, lam) -> float:
+        tot = 0.0
+        for blk in partition:
+            if len(blk) < 2:
+                continue
+            ds = [_d_euclid(codes, A, b, X, y, inv, i, j, lam) ** 2
+                  for a, i in enumerate(blk) for j in blk[a + 1:]]
+            tot += sum(ds) / len(blk)
+        return tot
+
+    print(f"  {'λ':>6s} " + " ".join(f"{f'{i}-{j}':>7s}" for i, j in pairs)
+          + f" {'최근접':>6s} {'전수탐색 K=2':>12s} {'greedy K=2':>11s} {'첫 병합':>7s}")
+    for lam in lams:
+        vals = [_d_euclid(codes, A, b, X, y, inv, i, j, lam) for i, j in pairs]
+        lo = min(vals)
+        near = "/".join(f"{i}{j}" for (i, j), v in zip(pairs, vals) if abs(v - lo) < 1e-6)
+        c = {shown(p): wcss(p, lam) for p in parts2}
+        mv = min(c.values())
+        pick = "/".join(sorted(k for k, v in c.items() if abs(v - mv) < 1e-6))
+        gpart, ghist = _agglomerative(codes, A, b, X, y, inv, _d_euclid, lam)
+        gpick = _show(gpart)
+        first = "".join(str(i) for i in ghist[0][1])
+        flag = "" if gpick == "02 | 13" else "  <- greedy 깨짐"
+        print(f"  {lam:6.1f} " + " ".join(f"{v:7.3f}" for v in vals)
+              + f" {near:>6s} {pick:>12s} {gpick:>11s} {first:>7s}{flag}")
+    print()
+    # 교차점을 수치로 정확히 찾아 손계산과 대조한다
+    def nearest_is_02_13(lam) -> bool:
+        vals = {(i, j): _d_euclid(codes, A, b, X, y, inv, i, j, lam) for i, j in pairs}
+        lo = min(vals.values())
+        return all(abs(vals[p] - lo) > 1e-9 or p in {(0, 2), (1, 3)} for p in vals)
+
+    lo_l, hi_l = 0.0, 20.0
+    for _ in range(60):
+        mid = (lo_l + hi_l) / 2
+        if nearest_is_02_13(mid):
+            lo_l = mid
+        else:
+            hi_l = mid
+    print(f"  이분법으로 찾은 최근접쌍 교차점: λ = {lo_l:.4f}   (손계산 √12 = {12**0.5:.4f})")
+    print()
+    print("  ★ 예측 P8 은 **절반만 맞았다.** 맞은 쪽부터:")
+    print("    λ 가 3.464 를 넘으면 최근접쌍이 (1,2) 로 바뀐다. 교차점이 손계산과 소수 4자리까지 같다.")
+    print("    (1,2) 는 코드 01 과 10 — **두 유닛을 동시에 가로지르는 병합**이다.")
+    print("    이유: (1,2) 는 ΔA 가 크지만(‖ΔA‖²=13) Δb 가 작다(0.25).")
+    print("    λ 를 키우면 Δb 항이 지배하므로 **절편만 비슷하면 계수가 아무리 달라도** 가깝다고 나온다.")
+    print()
+    print("  ⚠️ 틀린 쪽: '앵커가 깨진다' 고 예측했는데, **전수탐색은 λ=10 에서도 안 깨진다.**")
+    print("     표의 '전수탐색 K=2' 열이 끝까지 02 | 13 이다. 왜 그런지 파고들면 이렇다:")
+    print()
+    print("       K=2 균형 분할은 네 조각을 **둘씩 짝지어야** 한다.")
+    print("       (1,2) 를 한 블록으로 쓰면 나머지 (0,3) 이 **강제**된다.")
+    print("       그런데 (0,3) 은 여섯 쌍 중 **가장 먼** 쌍이다 (Δb=2.5 라 λ 에 가장 민감).")
+    print("       03 | 12 의 비용 = 13 + 3.25·λ²  vs  02 | 13 의 비용 = 4 + λ².")
+    print("       λ 가 아무리 커도 후자가 작다. **전수탐색은 이 짝의 강제를 미리 본다.**")
+    print()
+    print("  ★★ 그래서 진짜 결론은 예측보다 날카롭다 — **λ 의 위험은 greedy 의 위험이다.**")
+    print("     표의 'greedy K=2' 열을 보라. λ=3.5 부터 012 | 3 으로 바뀐다.")
+    print("     greedy 는 첫 수로 (1,2) 를 합치고, 그 순간 (0,3) 이 강제되는 미래를 못 본다.")
+    print("     한 번 합치면 무를 수 없기 때문이다.")
+    print()
+    print("     → STEP 6 에서 '우리 ε-path 는 상계다' 라고 추상적으로 적었던 것의 **구체적 실례**다.")
+    print("       상계라는 사실이 손해로 나타나는 방식이 이것이다: 손잡이를 잘못 돌리면")
+    print("       **전수탐색이라면 안 틀렸을 자리에서 greedy 만 틀린다.**")
+    print()
+    print("  ★★★ 그리고 이것이 앵커가 필수인 이유다.")
+    print("     ε 만 보고 있으면 이 사고를 알아챌 수 없다 — λ 를 바꿨으니 ε 값도 바뀌는 게 당연하고,")
+    print("     '조금 나빠졌네' 로 보일 뿐이다. **정답을 아는 장난감**에서만 '틀렸다' 가 보인다.")
+    print()
+    print("  반대쪽도 보자 — λ=0 (절편을 아예 버리기) 은 이 장난감에서 앵커를 통과한다.")
+    print("    그렇다고 안전하다는 뜻은 아니다. 교훈 L2 의 상황(기울기는 같은데 절편이 다른")
+    print("    두 조각)이 이 장난감에는 없을 뿐이다. 실모델에서는 λ=0 이 그 둘을 합쳐버린다.")
+    print()
+    print("  → 방침: **λ=1 을 기준선으로 고정하고**, λ 를 바꿀 때는")
+    print("    'ε 이 얼마나 변하나' 가 아니라 **'앵커를 아직 통과하나'** 를 먼저 본다.")
+
+
+# ================================================================ STEP 10
+#
+# param-decomp 핸드북이 **필수 절차**로 규정한 것:
+#   "메커니즘이 이미 알려진 타깃을 먼저 분해해 방법이 그것을 복원하는지 확인하라.
+#    이 앵커는 필수다 — 학습 부족과 잘못된 재구성 목적함수는 둘 다 '깨끗해 보이는 null'을
+#    만들 수 있어서, 앵커 없는 타깃은 '구조가 정말 없음'과 '방법이 잘못 설정됨'을 구분 못 한다."
+# 우리는 앵커를 이미 갖고 있다 — STEP 6의 전수탐색 정답 {0,2}|{1,3}.
+
+
+def step10() -> None:
+    head(10, "앵커 — 클러스터링 코드가 정답을 복원하는지 먼저 확인한다")
+
+    legend("K", "ε", "[A_r | b_r]", "centroid")
+    codes, A, b, X, y, inv = _toy_pieces()
+    R = len(codes)
+    TRUTH = "02 | 13"
+
+    print("  선행연구가 요구하는 순서는 이것이다:")
+    print("    실모델에 돌리기 **전에**, 정답을 아는 장난감에서 정답이 나오는지 확인한다.")
+    print("    통과 못 하면 거기서 멈춘다. 실모델 결과를 해석하지 않는다.")
+    print()
+    print(f"  우리 앵커: STEP 6의 전수탐색 최적  {TRUTH}  (= 유닛1의 상태로 묶기)")
+    print("  시험 대상: average linkage 계층 병합, λ=1, 척도 넷.\n")
+
+    print(f"  {'척도':>20s} {'병합 순서':>22s} {'K=2 결과':>10s} {'앵커':>6s}")
+    passed = []
+    for name, fn in METRICS:
+        part, hist = _agglomerative(codes, A, b, X, y, inv, fn, lam=1.0)
+        seq = " -> ".join("".join(str(i) for i in mg) for _, mg, _ in hist)
+        got = _show(part)
+        ok = got == TRUTH
+        passed.append((name, ok))
+        print(f"  {name:>20s} {seq:>22s} {got:>10s} {'통과' if ok else '실패':>6s}")
+    print()
+    print("  ★ STEP 8의 결론이 그대로 재현된다 — 이번엔 '분할 전수 비교'가 아니라")
+    print("    '실제 알고리즘을 돌려서' 확인했다는 점이 다르다. 두 경로가 같은 답을 준다.")
+    print()
+    for name, ok in passed:
+        if not ok:
+            print(f"    {name} 는 앵커를 통과하지 못한다 -> 실모델에 쓰지 않는다.")
+    print()
+    print("  → **유클리드와 logit 만 다음 단계로 보낸다.** 이게 앵커의 용도다.")
+    print("    ε 만 보고 있었다면 해밍도 cosine 도 '조금 더 나쁜 곡선'으로 보였을 뿐이다.")
+    print()
+    # ---------------- VPD 의 확률적 선택 -------------------------------
+    print("  " + "-" * 70)
+    print("  STEP 9 에서 본 것: greedy 는 첫 수를 무를 수 없어 틀릴 수 있다.")
+    print("  VPD 논문이 그 대응책을 적어뒀다 — **일부러 최선이 아닌 쌍을 고른다.**")
+    print()
+    print("    후보 쌍을 비용 오름차순으로 세우고 순위 J 에 확률을 준다:")
+    print("      P(J) ∝ exp(−γ·J),   논문 설정 γ = 0.2")
+    print("    역CDF 로 뽑는다:  J = ⌊ −log(1 − u(1 − e^{−γN})) / γ ⌋,  u ~ U(0,1)")
+    print()
+
+    gamma, N = 0.2, R * (R - 1) // 2          # 첫 병합에서 후보 쌍 6개
+    w = torch.tensor([float(torch.exp(torch.tensor(-gamma * J))) for J in range(N)])
+    prob = w / w.sum()
+    print(f"  후보가 {N}개일 때(=조각 4개의 첫 병합) 순위별 확률:")
+    print("    " + " ".join(f"J={J}:{prob[J]*100:5.1f}%" for J in range(N)))
+    print()
+    w_inf = 1.0 / (1.0 - float(torch.exp(torch.tensor(-gamma))))
+    print(f"  논문이 인용한 18.1% 는 후보가 '아주 많을 때'의 값이다:")
+    print(f"    가중치 합 -> 1/(1−e^{{−0.2}}) = {w_inf:.3f},  P(J=0) = {100/w_inf:.1f}%")
+    print(f"    후보가 {N}개뿐이면 합이 {w.sum():.3f} 이라 P(J=0) = {prob[0]*100:.1f}% 로 커진다.")
+    print("    → γ 의 효과는 **후보 수에 따라 달라진다.** 조각이 많을수록 더 과감해진다.")
+    print()
+
+    # 역CDF 샘플링이 정말 저 분포를 주는지 확인
+    torch.manual_seed(0)
+    u = torch.rand(200_000)
+    J = torch.floor(-torch.log(1 - u * (1 - torch.exp(torch.tensor(-gamma * N)))) / gamma)
+    emp = torch.bincount(J.long(), minlength=N).float() / len(u)
+    print("  역CDF 샘플링 20만 번으로 검산:")
+    print("    " + " ".join(f"J={j}:{emp[j]*100:5.1f}%" for j in range(N)))
+    print(f"    이론값과 최대 차이 {float((emp[:N]-prob).abs().max())*100:.2f}%p — 식이 맞다.")
+    print()
+
+    # ---- 그래서 STEP 9 의 사고를 구해내는가 ----
+    print("  " + "-" * 70)
+    print("  이제 진짜 시험: STEP 9 에서 greedy 가 틀렸던 λ=5 에 확률적 선택을 넣어본다.")
+    print()
+
+    def stochastic_once(lam, gen) -> tuple:
+        """확률적 계층 병합 1회. greedy 와 같지만 최선 대신 순위추첨으로 고른다."""
+        blocks = [[i] for i in range(R)]
+        while len(blocks) > 2:
+            cand = []
+            for p in range(len(blocks)):
+                for q in range(p + 1, len(blocks)):
+                    ds = [_d_euclid(codes, A, b, X, y, inv, i, j, lam)
+                          for i in blocks[p] for j in blocks[q]]
+                    cand.append((sum(ds) / len(ds), p, q))
+            cand.sort()
+            n = len(cand)
+            uu = torch.rand(1, generator=gen).item()
+            jj = int(-torch.log(torch.tensor(1 - uu * (1 - torch.exp(torch.tensor(-gamma * n)))))
+                     / gamma)
+            jj = min(jj, n - 1)
+            _, p, q = cand[jj]
+            merged = blocks[p] + blocks[q]
+            blocks = [bl for k, bl in enumerate(blocks) if k not in (p, q)] + [merged]
+        return [sorted(bl) for bl in blocks]
+
+    def eps_of(part) -> float:
+        pred = torch.empty_like(y)
+        for blk in part:
+            m = torch.isin(inv, torch.tensor(blk))
+            ww = torch.tensor([float((inv == r).sum()) for r in blk])
+            ww = ww / ww.sum()
+            pred[m] = X[m] @ (ww[:, None] * A[blk]).sum(0) + (ww * b[blk]).sum()
+        return (pred - y).abs().mean().item()
+
+    for lam in (1.0, 5.0):
+        gpart, _ = _agglomerative(codes, A, b, X, y, inv, _d_euclid, lam)
+        gen = torch.Generator().manual_seed(0)
+        runs = [stochastic_once(lam, gen) for _ in range(200)]
+        hits = sum(1 for r in runs if _show(r) == TRUTH)
+        best = min(runs, key=eps_of)
+        print(f"  λ={lam:.0f}:  greedy = {_show(gpart):>9s} (ε={eps_of(gpart):.4f})")
+        print(f"        확률적 200회 중 정답 {hits}회 ({hits/2:.1f}%),"
+              f" 최선 = {_show(best):>9s} (ε={eps_of(best):.4f})")
+    print()
+    print("  ★ λ=5 에서 greedy 는 **항상** 틀리지만, 확률적 선택은 여러 번 중 몇 번은 맞힌다.")
+    print("    그리고 우리는 ε 을 볼 수 있으므로 **여러 번 돌려 가장 좋은 것을 취하면 된다.**")
+    print("    이게 VPD 가 말한 '국소최소 탈출' 의 전부다 — 구현은 실제로 10줄이었다.")
+    print()
+    print("  ★★ 단, 오해하지 말 것: 확률적 선택은 **greedy 의 손실을 줄일 뿐 없애지 않는다.**")
+    print("     조각이 4개라 후보가 6개뿐이니 200회면 공간을 사실상 다 훑는다.")
+    print("     조각이 1,400개면 첫 병합 후보만 979,300개다. 같은 비율의 탐색은 불가능하다.")
+    print("     → **우리 ε-path 는 여전히 상계다.** 확률적 선택은 그 상계를 낮출 뿐이다.")
+    print("       그래서 보고할 때 손잡이(γ, linkage, λ, 재시작 횟수)를 함께 적어야 한다.")
+
+
+# ================================================================ STEP 11
+#
+# param-decomp 핸드북의 공정성 조건:
+#   "...and includes the dense and chance endpoints. Merely beating the architectural-unit
+#    count is not evidence of useful minimality. If a bad or untrained baseline passes the
+#    stated bar, strengthen the bar before interpreting."
+# Aletheia Table 3 의 SLFN 열이 그 실례다 — FL-Net 과 크기가 같고 초기화만 랜덤인 망.
+
+
+def step11() -> None:
+    head(11, "대조군 — 클러스터링이 '아무렇게나 묶기'를 이기는가")
+
+    legend("K", "ε", "ε-path", "centroid")
+    codes, A, b, X, y, inv = _toy_pieces()
+    R = len(codes)
+
+    def eps_of(part) -> float:
+        pred = torch.empty_like(y)
+        for blk in part:
+            m = torch.isin(inv, torch.tensor(blk))
+            w = torch.tensor([float((inv == r).sum()) for r in blk])
+            w = w / w.sum()
+            pred[m] = X[m] @ (w[:, None] * A[blk]).sum(0) + (w * b[blk]).sum()
+        return (pred - y).abs().mean().item()
+
+    print("  ε-path 를 그렸다고 하자. 곡선이 아래로 내려간다. 그래서 뭐가 증명됐나?")
+    print("  **아무것도 아니다** — 비교 대상이 없으면 곡선은 해석할 수 없다.")
+    print()
+    print("  선행연구가 요구하는 것은 두 가지다:")
+    print("    (1) 양 끝점을 포함할 것 — K=R (안 합침, ε=0) 과 K=1 (전부 하나).")
+    print("    (2) 나쁜 기준선이 통과하면 기준을 강화할 것.")
+    print()
+    print("  가장 엄한 기준선은 이것이다: **모델·데이터·K·대표값 방식이 전부 같고")
+    print("  오직 '어느 조각을 어느 블록에 넣는가' 만 다른 배정.** 다른 변수가 안 섞인다.")
+    print("  (Aletheia Table 3 의 SLFN 열이 딱 이 형태다 — FL-Net 과 크기가 같고 초기화만 랜덤.)")
+    print()
+
+    print(f"  {'K':>3s} {'분할 수':>7s} {'최적 ε':>9s} {'랜덤 배정 평균 ε':>16s} "
+          f"{'최악 ε':>9s} {'이득(배)':>9s}")
+    rows = []
+    for K in range(R, 0, -1):
+        parts = _k_partitions(list(range(R)), K)
+        es = [eps_of(p) for p in parts]
+        lo, mean, hi = min(es), sum(es) / len(es), max(es)
+        gain = float("inf") if lo < 1e-12 else mean / lo
+        rows.append((K, len(parts), lo, mean, hi, gain))
+        g = "—" if lo < 1e-12 else f"{gain:9.2f}"
+        print(f"  {K:>3d} {len(parts):>7d} {lo:9.4f} {mean:16.4f} {hi:9.4f} {g:>9s}")
+    print()
+    print("  읽는 법:")
+    print("    K=4 : 안 합쳤으니 ε=0. **dense 종점.** 분할이 하나뿐이라 랜덤도 같다.")
+    print("    K=1 : 전부 한 덩어리. **chance 종점.** 분할이 하나뿐이라 여기도 랜덤과 같다.")
+    print("    → 양 끝점에서는 클러스터링이 할 일이 없다. **가운데에서만 이득이 생긴다.**")
+    print("      곡선의 의미는 전부 그 가운데 구간에 있다.")
+    print()
+
+    K2 = [r for r in rows if r[0] == 2][0]
+    print(f"  ★ K=2 를 보자. 최적 ε={K2[2]:.4f}, 랜덤 평균 ε={K2[3]:.4f}, 최악 ε={K2[4]:.4f}.")
+    print(f"    클러스터링이 아무렇게나 묶기보다 **{K2[5]:.2f}배** 낫다.")
+    print("    이 배수가 곧 '클러스터링이 실제로 한 일' 의 크기다.")
+    print()
+    print("  ★★ 왜 '랜덤 배정' 이 '학습 안 된 모델' 보다 엄한 기준선인가:")
+    print("     학습 안 된 모델을 쓰면 바뀌는 것이 너무 많다 — 가중치도, 조각 개수도,")
+    print("     [A_r|b_r] 의 스케일도 전부 다르다. 곡선이 달라져도 무엇 때문인지 모른다.")
+    print("     랜덤 배정은 **오직 배정만** 바꾼다. 차이가 나면 그건 배정 때문이다.")
+    print("     둘 다 두면 좋지만, 순서는 랜덤 배정이 먼저다.")
+    print()
+
+    # 랜덤 '라벨링' 과 랜덤 '분할' 이 같은지 확인 — R=4, K=2 에서는 같다
+    print("  덤: '랜덤 배정' 을 어떻게 뽑을지도 정해야 한다. 두 가지가 있다.")
+    print("    (a) 조각마다 라벨을 K개 중 균등하게 뽑는다   (b) 분할을 균등하게 뽑는다")
+    lab = {}
+    for mask in range(1 << R):
+        g0 = [i for i in range(R) if not (mask >> i) & 1]
+        g1 = [i for i in range(R) if (mask >> i) & 1]
+        if not g0 or not g1:
+            continue
+        lab[_show([g0, g1])] = lab.get(_show([g0, g1]), 0) + 1
+    print(f"    R=4, K=2 에서 (a)는 라벨링 {sum(lab.values())}가지가 분할 {len(lab)}개로 모이고,")
+    print(f"    각 분할이 정확히 {set(lab.values())} 번씩 나온다 -> **(a)와 (b)가 일치한다.**")
+    print("    R 이나 K 가 커지면 (a)는 균형 분할을 선호해 둘이 갈라진다.")
+    print("    → 실모델에서는 **어느 쪽을 썼는지 명시**해야 한다. 우리는 (a)를 쓴다")
+    print("      ('배정만 랜덤' 이라는 말과 뜻이 같으므로).")
+    print()
+    print("  ▶ 이 STEP 의 결론 한 줄:")
+    print("    ε-path 는 혼자서는 아무 말도 하지 않는다. **같은 그림에 랜덤 배정 곡선을 겹쳐야**")
+    print("    비로소 '이 모델이 압축된다' 를 말할 수 있다. 안 겹치면 그냥 곡선 하나다.")
+
+
+# ================================================================ STEP 12
+#
+# 2026-08-19 문헌 조사 후속. polytope lens 원문이 우리 조견표를 'k=1' 이라 규정하고
+# "decomposable description 을 찾는 데 명백히 최적이 아니다" 라고 적어뒀다.
+# 2026년 MFA 논문이 'k>1' 로 SAE 를 크게 이겼다.
+# 새 결과를 내려는 게 아니라, 왜 그 계열이 이겼는지를 우리 4조각에서 확인한다.
+
+
+def step12() -> None:
+    head(12, "조견표는 'k=1' 이다 — 4조각은 사실 유닛 기여 2개가 만든 것")
+
+    legend("A_r", "b_r", "[A_r | b_r]", "r", "K", "Ω", "ε")
+    codes, A, b, X, y, inv = _toy_pieces()
+
+    print("  STEP 6~11 에서 우리는 조각 4개를 '서로 다른 4개' 로 다뤘다.")
+    print("  묶을지 말지만 고민했지 **그 4개가 어디서 왔는지**는 안 물었다.")
+    print()
+    print("  선행연구가 우리 방식에 붙인 이름이 있다 — polytope lens 원문:")
+    print()
+    print("    \"클러스터링은 k-sparse 피처를 찾는 것으로 볼 수 있는데, 거기서 k = 1 이다.")
+    print("     N개 클러스터를 찾는 것은 N개 기저 방향 중 **한 번에 하나만 켜질 수 있는**")
+    print("     과완비 기저를 찾는 것과 같다. 이건 신경망의 분해 가능한 설명을 찾는 데")
+    print("     **명백히 최적이 아니다** — 이상적으로는 k > 1 을 허용해야 한다.\"")
+    print()
+    print("  우리 조견표는 입력 하나당 정확히 한 줄을 쓴다. 그게 k=1 이다.")
+    print("  그러면 k>1 은 무엇인가? 4조각에서 바로 보인다.\n")
+
+    # ---- 항등식에서 유도 ----
+    print("  " + "-" * 70)
+    print("  STEP 2 에서 얻은 항등식을 다시 보자:")
+    print()
+    print("      A_r = W2 · D(r) · W1        b_r = W2 · D(r) · b1 + b2")
+    print()
+    print("  여기서 D(r) = diag(r) 이다. 즉 **r 에 대해 선형**이다.")
+    print("  선형이면 쪼갤 수 있다 — 유닛 하나씩 떼어서 더하면 된다:")
+    print()
+    print("      [A_r | b_r]  =  base  +  Σ_i  r_i · c_i")
+    print()
+    print("      base = [0 | b2]                         (전부 꺼진 상태)")
+    print("      c_i  = [ W2[:,i]⊗W1[i,:] | W2[:,i]·b1[i] ]   (유닛 i 가 켜질 때 더해지는 것)")
+    print()
+    print("  손으로 확인해 보자. 우리 토이는 W1 = I, b1 = [-.5,-.5], W2 = [2,3], b2 = 1.\n")
+
+    base = torch.cat([A[0], b[0:1]])                 # r=00 조각이 곧 base
+    c0 = torch.cat([A[2], b[2:3]]) - base            # r=10 - base
+    c1 = torch.cat([A[1], b[1:2]]) - base            # r=01 - base
+    fmt = lambda t: "[" + ", ".join(f"{v:5.1f}" for v in t.tolist()) + "]"  # noqa: E731
+    print(f"    base            = {fmt(base)}      (조각 0 = 코드 00)")
+    print(f"    c_0 (유닛0 기여) = {fmt(c0)}      W2[0]=2 만큼 W1 의 0행이 더해진다")
+    print(f"    c_1 (유닛1 기여) = {fmt(c1)}      W2[1]=3 만큼 W1 의 1행이 더해진다")
+    print()
+    print(f"  {'조각':>5s} {'코드':>5s} {'base + r0·c0 + r1·c1':>26s} {'실제 [A_r|b_r]':>22s} {'오차':>9s}")
+    worst = 0.0
+    for r in range(len(codes)):
+        r0, r1 = float(codes[r][0]), float(codes[r][1])
+        pred = base + r0 * c0 + r1 * c1
+        real = torch.cat([A[r], b[r : r + 1]])
+        err = float((pred - real).abs().max())
+        worst = max(worst, err)
+        code = "".join(str(int(v)) for v in codes[r])
+        print(f"  {r:>5d} {code:>5s} {fmt(pred):>26s} {fmt(real):>22s} {err:9.1e}")
+    print()
+    print(f"  ★ 최대 오차 {worst:.1e} — **정확하다.** 근사가 아니라 항등식이다.")
+    print("    조각 4개는 독립적인 넷이 아니었다. **숫자 2개(r_0, r_1)가 만들어낸 것**이다.")
+    print()
+    # ---- 같은 Ω 예산, 다른 결과 ----
+    print("  " + "-" * 70)
+    print("  이제 STEP 6 과 나란히 놓아보자. **둘 다 '2개' 를 쓴다.**")
+    print()
+
+    def eps_of(part) -> float:
+        pred = torch.empty_like(y)
+        for blk in part:
+            m = torch.isin(inv, torch.tensor(blk))
+            w = torch.tensor([float((inv == r).sum()) for r in blk])
+            w = w / w.sum()
+            pred[m] = X[m] @ (w[:, None] * A[blk]).sum(0) + (w * b[blk]).sum()
+        return (pred - y).abs().mean().item()
+
+    eps_k1 = eps_of([[0, 2], [1, 3]])
+
+    # k>1 재구성: base + Σ r_i c_i 로 모든 점을 복원
+    pred = torch.empty_like(y)
+    for r in range(len(codes)):
+        m = inv == r
+        v = base + float(codes[r][0]) * c0 + float(codes[r][1]) * c1
+        pred[m] = X[m] @ v[:2] + v[2]
+    eps_k2 = (pred - y).abs().mean().item()
+
+    print(f"  {'설명 형태':>24s} {'쓰는 것':>18s} {'Ω':>4s} {'ε':>9s}")
+    print(f"  {'k=1  조견표 (STEP 6)':>24s} {'대표 [A|b] 2줄':>18s} {2:>4d} {eps_k1:9.4f}")
+    print(f"  {'k>1  유닛 기여':>24s} {'base + c_0, c_1':>18s} {2:>4d} {eps_k2:9.4f}")
+    print()
+    print("  ★★ 같은 2개인데 한쪽은 ε=1.2531, 다른 쪽은 ε=0 이다.")
+    print()
+    print("    왜 이런 차이가 나나: k=1 은 입력마다 **줄 하나를 고른다**. 2줄뿐이면")
+    print("    조각 4개를 2개 값으로 뭉갤 수밖에 없다.")
+    print("    k>1 은 입력마다 **조합을 만든다**. 2개 부품으로 4가지 조합이 나온다.")
+    print("    부품 h개 -> 조합 2^h 가지. **지수 대 선형**이고, 이게 전부다.")
+    print()
+    print("  이걸 일반화하면:")
+    print(f"    조각(영역) 수      최대 2^h        - 우리 토이 4,  moons h=64 에서 1,378")
+    print(f"    유닛 기여 수       h + 1          - 우리 토이 3,  moons h=64 에서 65")
+    print()
+    print("  ▶ **영역 클러스터링이 왜 파라미터 분해에 밀렸는지가 여기 있다.**")
+    print("    우리가 뭘 잘못해서가 아니라, D(r) 이 선형이라는 항등식이")
+    print("    k>1 쪽에 공짜로 지수적 이득을 주기 때문이다.")
+    print()
+    print("  ▶ 그리고 이건 APD 의 첫 번째 성질 **faithfulness** 그 자체다:")
+    print("    '컴포넌트들의 합이 원본 파라미터를 정확히 복원한다.'")
+    print("    우리는 그걸 학습 없이, 항등식만으로 얻었다. (단, 1층에서만 — STEP 13)")
+    print()
+    print("  ▶ I4 도 다시 읽힌다. STEP 6 에서 '유닛1이 더 중요하다' 가 나왔는데,")
+    print(f"    이제 이유가 눈에 보인다 — c_1 = {fmt(c1)} 이 c_0 = {fmt(c0)} 보다 크다.")
+    print("    'causal importance' 는 결국 **‖c_i‖ 가 얼마나 큰가** 였다.")
+    print()
+    print("  ⚠️ 바뀌지 않는 것: **라우팅**. k>1 로 가도 r 을 알려면 첫 층을 돌려야 한다.")
+    print("     Ω 는 줄었지만 오라클 호출은 그대로다. Q1 은 k 와 무관한 별개 문제다.")
+
+
+# ================================================================ STEP 13
+#
+# STEP 12 의 가법 분해는 1층에서 유도했다. 깊어지면 어떻게 되는가?
+# A_r = W3·D2·W2·D1·W1 — r 에 대해 층을 가로질러 '곱' 이 된다. 가법이 아니다.
+# 총 유닛 수를 맞춰 학습해둔 두 MNIST 모델이 이 질문의 대조군으로 이미 준비돼 있다.
+
+
+def _additive_residual(model, patterns: torch.Tensor, m: int = 1500,
+                       seed: int = 0) -> tuple:
+    """[A_r|b_r] 를 base + Σ r_i·c_i 로 최소제곱 맞춤한 뒤 상대 잔차를 돌려준다.
+
+    1층이면 항등식이라 잔차가 부동소수점 수준이어야 한다.
+    최소제곱으로 푸는 이유: base·c_i 를 가중치에서 직접 만들지 않고
+    '데이터가 그 구조에 맞는지' 만 묻기 위해서다 (구조를 가정하지 않는 검사).
+    """
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(patterns), generator=g)[:m]
+    P = patterns[idx]
+    with torch.no_grad():
+        A, b = model.effective_affine(P)
+    M = torch.cat([A.reshape(len(P), -1), b], dim=1).double()      # (m, C_out·(d+1))
+    R = P.double()
+    X = torch.cat([torch.ones(len(R), 1, dtype=torch.float64), R], dim=1)  # (m, 1+U)
+    sol = torch.linalg.lstsq(X, M).solution
+    rel = ((X @ sol - M).norm() / M.norm()).item()
+    return rel, M.shape[1], P.shape[1], len(P)
+
+
+def step13() -> None:
+    head(13, "깊이가 합성성을 깨뜨린다 — 그리고 그게 SPD 가 존재하는 이유다")
+
+    legend("A_r", "b_r", "[A_r | b_r]", "r", "C_out", "Ω", "ε")
+
+    print("  STEP 12 의 가법 분해는 **1층에서** 유도했다. 2층이면 어떻게 되나?")
+    print()
+    print("      1층:  A_r = W2 · D(r) · W1                 -> D(r) 이 한 번만 들어간다")
+    print("      2층:  A_r = W3 · D2(r) · W2 · D1(r) · W1   -> D 가 두 번, 사이에 W2 가 낀다")
+    print()
+    print("  2층에서는 r 의 성분들이 **곱해진다**. r_i·r_j 항이 생기므로 가법이 아니다.")
+    print("  그런데 이건 계산으로 확인할 문제다. 우리에겐 대조군이 이미 있다:")
+    print("  **총 유닛 수를 128 로 맞춰 학습해둔 MNIST 모델 두 개** (stage1_log §1).")
+    print("  유닛 수가 같으니 차이가 나면 원인은 **깊이 하나로 특정된다.**\n")
+
+    print("  검사 방법: [A_r|b_r] 를 base + Σ r_i·c_i 로 **최소제곱 맞춤**하고 잔차를 본다.")
+    print("  (가중치에서 c_i 를 직접 만들지 않는다 — 구조를 가정하지 않고 '맞는지' 만 묻는다.)\n")
+
+    print(f"  {'모델':>18s} {'유닛':>5s} {'영역':>9s} {'[A|b] 크기':>11s} "
+          f"{'자유도':>7s} {'상대 잔차':>11s}  판정")
+    got = {}
+    for hidden in ([128], [64, 64]):
+        tag = "x".join(map(str, hidden))
+        try:
+            model, _ = load_model("mnist", hidden, 0, device="cpu")
+            d = torch.load(f"artifacts/regions/mnist_h{tag}_s0_train.pt",
+                           map_location="cpu")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] mnist h={hidden}: {type(e).__name__} — {e}")
+            continue
+        rel, dim, U, m = _additive_residual(model, d["patterns"])
+        got[tag] = (rel, dim, U, len(d["patterns"]))
+        ok = "가법 성립" if rel < 1e-6 else "**깨짐**"
+        print(f"  {'mnist h=' + str(hidden):>18s} {U:5d} {len(d['patterns']):9,d} "
+              f"{dim:11,d} {1 + U:7d} {rel:11.2e}  {ok}")
+    print()
+
+    if "128" in got and "64x64" in got:
+        r1, dim, U, R1 = got["128"]
+        r2 = got["64x64"][0]
+        print(f"  ★ 1층은 {r1:.1e} — **부동소수점 수준**이다. 항등식이 실수 가중치에서도 성립한다.")
+        print(f"    2층은 {r2:.1e} — 여섯 자릿수 차이로 깨진다. **유닛 수는 똑같이 128 인데도.**")
+        print()
+        print(f"  숫자로 본 압축 (1층, ε=0 을 유지하면서):")
+        print(f"    k=1 조견표로 ε=0 을 내려면 줄이 {R1:,}개 필요하다  "
+              f"-> {R1 * dim:,} 개 숫자")
+        print(f"    k>1 유닛 기여는 {1 + U}개면 된다                    "
+              f"-> {(1 + U) * dim:,} 개 숫자")
+        print(f"    **{R1 / (1 + U):.0f}배 압축, 오차 0.**")
+        print()
+    print("  ▶ 이 STEP 의 핵심 — **깊이 ≥ 2 에서는 '공짜 분해' 가 없다.**")
+    print("    1층에서는 분해가 항등식으로 그냥 나온다. 2층부터는 나오지 않는다.")
+    print("    그러면 어떻게 하나? **분해를 학습한다.**")
+    print("    → 그게 APD → SPD → VPD 가 하는 일이고, **Stage 2 의 존재 이유**다.")
+    print("      Stage 2 를 '다음에 할 다른 주제' 가 아니라 **여기서 막힌 것의 해법**으로 읽어야 한다.")
+    print()
+    print("  ▶ I2 (깊이 축) 에 새 의미가 붙는다.")
+    print("    깊이는 통제 변수가 아니라 **합성성을 깨뜨리는 변수**다.")
+    print("    spiral 에서 2층이 1층을 이긴 것(95.5% -> 100%)과 같은 원인일 수 있다:")
+    print("    층을 가로지르는 곱이 표현력을 주고, **그 대가로 분해 가능성을 가져간다.**")
+    print("    표현력과 해석가능성의 교환이 이 한 줄에 들어 있다.")
+    print()
+    print("  ▶ 왜 2D 로는 이 실험을 못 하나 — I3 에 붙는 세 번째 근거")
+    print("    moons 의 증강행렬은 C_out×(d+1) = 2×3 = 6 개 숫자뿐이다.")
+    print("    자유도가 h+1 = 65 여도 6 을 넘을 수 없으니 **구속력이 없다.**")
+    print("    시험이 성립하려면 C_out×(d+1) > h 여야 하고, MNIST 는 7,850 > 128 이다.")
+    print("    → '2D 는 그리기 쉬워서' 가 아니라 **잴 수 있는 것이 서로 다르다.**")
+
+
 # ================================================================ 그림
 
 
@@ -494,23 +1860,65 @@ def buildup_figure(model: MLP) -> Path:
 # ================================================================ main
 
 
+def _load_setting(name: str, hidden: list[int]) -> tuple | None:
+    """(model, dataset, test_acc) 를 얻는다. 체크포인트가 없으면 None.
+
+    STEP 0은 '실제 학습된 모델'의 shape과 정확도를 보여주는 것이 요점이라
+    임의의 숫자를 지어내지 않는다. 없으면 그 세팅만 빠진다.
+    """
+    try:
+        model, _ = load_model(name, hidden, 0, device="cpu")
+        ds = get_dataset(name, seed=0)
+        with torch.no_grad():
+            acc = (model(ds.x_test).argmax(1) == ds.y_test).float().mean().item()
+        return model, ds, acc
+    except Exception as e:  # noqa: BLE001 — 없는 세팅은 조용히 건너뛴다
+        print(f"  [skip] {name} h={hidden}: {type(e).__name__} — {e}")
+        return None
+
+
 def main() -> None:
     ensure_dirs()
     setup_matplotlib()
     torch.set_printoptions(precision=3, sci_mode=False)
 
+    models = {}
+    for key, hidden in [("moons", [64]), ("spiral", [32, 32]), ("mnist", [128])]:
+        got = _load_setting(key, hidden)
+        if got is not None:
+            models[key] = got
+
+    step0_task(models)
+    step0_params(models)
+    step0_dimension()
+    step0_objective()
+
     step1()
     step2()
     step3()
 
-    model, _ = load_model("moons", [64], 0, device="cpu")
+    model = models["moons"][0]
     step4(model)
     step5()
     step6()
     step7()
+    step8()
+    step9()
+    step10()
+    step11()
+    step12()
+    step13()
 
-    out = buildup_figure(model)
-    print(f"\n{RULE}\n그림 저장: {out}\n{RULE}")
+    outs = [
+        task_figure(models),
+        architecture_figure(models),
+        dimension_figure(),
+        buildup_figure(model),
+    ]
+    print(f"\n{RULE}\n그림 저장:")
+    for o in outs:
+        print(f"  {o}")
+    print(RULE)
 
 
 if __name__ == "__main__":

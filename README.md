@@ -33,9 +33,19 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 터미널만 볼 때도 각 표 앞에 그 표의 기호 정의가 먼저 출력됩니다.
 문서·HTML 툴팁·터미널 범례 셋 다 `docs/symbols.md` 하나를 읽으므로 정의가 어긋날 수 없습니다.
 
-## 2. 그림 다섯 장 — 증거 전체
+## 2. 그림 여덟 장 — 문제 정의부터 증거까지
 
 `artifacts/figures/` (레포에 포함되어 있음, 재생성 불필요)
+
+**문제 정의** (walkthrough STEP 0 — 먼저 읽을 것)
+
+| 그림 | 무엇을 보여주나 |
+|---|---|
+| `step0_task.png` | **어떤 태스크인가.** moons / spiral / MNIST의 입력·정답과 학습된 결정 경계 |
+| `step0_architecture.png` | **파라미터가 어디에 붙어 있는가.** W1·b1·W2·b2의 shape와 역할 |
+| `step0_dimension.png` | **왜 하필 2차원인가.** 초평면 5개를 그대로 두고 d만 바꾸면 6 → 16 → 26조각 |
+
+**증거**
 
 | 그림 | 무엇을 보여주나 |
 |---|---|
@@ -45,7 +55,9 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 
 ## 3. 검증 결과 — 예측을 먼저 적고 맞췄는지
 
-[`docs/stage1_log.md`](docs/stage1_log.md). 예측 6개 전부 PASS.
+[`docs/stage1_log.md`](docs/stage1_log.md). 예측 10개 중 9개 PASS, 1개 부분 PASS.
+
+**구조 검증 (실모델 6개)**
 
 | | 예측 | 결과 |
 |---|---|---|
@@ -54,6 +66,18 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 | P3·P4 | Zaslavsky 상한 / 첫 층 상한과 일치 | 1,326 ≤ 2,081 / 1,881 > 529 |
 | P5 | 영역은 깊이 무관하게 볼록 (784차원 포함) | **위반 0** |
 | P6 | 2층 유닛의 꺾임은 첫 층 직선 위에서만 | **100.00 %** (대조군 대비 15배 분리) |
+
+**방법 검증 (4조각 앵커, 손으로 검산됨)**
+
+| | 예측 | 결과 |
+|---|---|---|
+| P7 | 해밍 거리는 유닛 중요도를 못 본다 | **PASS** — 정답과 오답에 똑같이 1.000, 고르지 못함 |
+| P8 | 절편 가중치 λ가 앵커를 깨뜨린다 | **부분 PASS** — 교차점 λ=√12 는 손계산과 일치하나, **깨지는 건 greedy뿐이고 전수탐색은 안 깨진다** |
+| P9 | greedy(average linkage)가 정답을 복원한다 | **PASS** — 유클리드·logit 통과, 해밍·cosine 실패 |
+| P10 | 클러스터링이 랜덤 배정을 이긴다 | **PASS** — K=2에서 **1.67배** |
+
+> P8이 절반 틀린 것이 오히려 수확이었습니다. **λ의 위험은 greedy의 위험**이고,
+> 이것이 "우리 ε-path는 상계다"라는 서술의 첫 구체적 실례입니다 (STEP 9).
 
 ## 4. 다음에 할 일
 
@@ -218,10 +242,20 @@ external/      Stage 2에서 클론할 외부 레포 (param-decomp)
 | 문헌 | 우리에게 주는 것 |
 |---|---|
 | **Sudjianto et al. 2020** — Unwrapping the Black Box of Deep ReLU Networks ([Aletheia](https://github.com/SelfExplainML/Aletheia)) | 영역 병합의 유일한 완성된 구현. `Merger`(agglomerative+kNN 연결성+refit), **`Pruner`(topk core+최근접 → D3의 답)**, `flatten`(→ Q1) |
-| Black et al. 2022 — polytope lens | 폴리토프 유사도 = affine 행렬 차이의 Frobenius norm (D1) |
-| Hanin & Rolnick 2019 — Deep ReLU Nets Have Surprisingly Few Activation Patterns | 직선·평면으로 잘라 영역을 세는 표준 기법 (우리 P5·I1이 이것의 재현) |
-| Srivastava et al. 2015 | 활성 코드 클러스터링 / 데이터 포인트에서 영역 샘플링 |
-| Chu et al. 2018 | PLNN의 국소 선형 분류기 |
+| Black et al. 2022 — polytope lens | 활성 / **부호벡터 `r` 위의 해밍 거리**로 HDBSCAN (D1의 네 번째 척도). ⚠️ Frobenius는 각주 8의 제안일 뿐 쓰이지 않았다 |
+| Hanin & Rolnick 2019 — Deep ReLU Nets Have Surprisingly Few Activation Patterns | **증분 정확 계수법**(꼭짓점 부호 검사 → Q4), 영역 수가 학습으로 거의 안 변한다는 결과(→ Q3 대조군), 볼록성 정리(Lemma 7 = 우리 P5) |
+| Srivastava et al. 2015 | 활성 코드(**submask**)의 t-SNE **시각화** + kNN·검색. ⚠️ 클러스터링 알고리즘은 쓰지 않는다. 학습 전/후 대조(Figure 3)가 우리 대조군의 선례 |
+| Chu et al. 2018 — OpenBox | PLNN의 국소 선형 분류기. **분해까지만 — 병합·클러스터링·ε 없음** (우리와 여기서 갈라진다) |
 | Elhage et al. 2022 — Toy Model of Superposition | Stage 2 배경 |
 | Nanda et al. 2023 — modular addition grokking | Stage 3 대조군 |
 | **[goodfire-ai/param-decomp](https://github.com/goodfire-ai/param-decomp)** — APD → SPD → VPD | Stage 2 본체. 그리고 **ε 척도(KL/MSE), MDL 클러스터링, 확률적 병합(γ=0.2), "앵커 필수" 규범**의 출처 |
+
+**2024~2026 — 이 계열은 멈추지 않았다** (2026-08-19 검색으로 확인. 자세히는 `prior_work.md` §9)
+
+| 문헌 | 우리에게 주는 것 |
+|---|---|
+| **From Directions to Regions** (`arXiv:2602.02464`, 2026-02) | ★★ **영역 기반 분해가 SAE를 크게 이긴다** (해석가능 비율 0.96 vs 0.29). 단 이기는 형태는 **soft 영역 + 국소 부분공간 + 여러 컴포넌트 동시 활성** — 우리 `k=1` 조견표가 아니다 |
+| **AffineLens** (`arXiv:2605.06218`, 2026-05) | 정확 영역 열거 도구 (BN·pooling·residual·conv 지원). **Q4의 도구가 이미 나와 있다** |
+| **Expressivity Saturation** (`arXiv:2606.21687`, 2026-06) | 선분 프로브 + 정확 열거. 과제가 어려울수록 **실현 영역이 줄어든다** — 우리 I2와 겹침 |
+| **Region Seeding** (`arXiv:2605.06300`, 2026-05) | 정규화 ↔ 영역 수를 정면으로. **Q3의 "정규화가 단순화한다"와 방향이 반대** |
+| **Re3** (Machine Learning, Springer, 2026-01) | 영역별 피처 귀속. OpenBox 계보의 현재형 — 여전히 **병합·ε 없음** |

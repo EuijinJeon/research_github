@@ -47,6 +47,12 @@ PAGES = [
 
 # 단일 페이지에 내장할 그림과 설명
 FIGURES = [
+    ("step0_task.png", "STEP 0-1  해석할 대상: 학습이 끝난 함수 세 개",
+     "moons / spiral / MNIST. 태스크를 잘 푸는 것이 목적이 아니라, 뜯어볼 함수를 얻는 것이 목적이다."),
+    ("step0_architecture.png", "STEP 0-2  파라미터가 어디에 붙어 있는가",
+     "W1·b1 이 공간을 자르고 W2·b2 가 살아남은 유닛을 섞는다. 조견표 한 줄이 MNIST에서 7,850개 숫자다."),
+    ("step0_dimension.png", "STEP 0-3  왜 하필 2차원인가",
+     "초평면 5개를 그대로 두고 d만 1→2→3 으로 바꾸면 영역이 6→16→26. 코드는 셋 다 5비트인데도 그렇다."),
     ("walkthrough_buildup.png", "ReLU 유닛을 하나씩 켜면 평면이 쪼개진다",
      "유닛 1→64개. 조각 수는 2^h 가 아니라 훨씬 느리게 늘어난다 (64개 → 1,378조각, 2^64 = 1.8×10¹⁹)."),
     ("polytopes_moons.png", "moons: 학습된 모델의 실제 폴리토프 분할",
@@ -213,10 +219,17 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
   .shell{grid-template-columns:264px minmax(0,1fr);gap:48px;padding:0 32px}
 }
 
-/* --- 좌측 레일 --- */
-.rail{position:sticky;top:0;align-self:start;max-height:100vh;overflow-y:auto;
-  padding:28px 0 56px;border-bottom:1px solid var(--line)}
-@media (min-width:1080px){.rail{border-bottom:0;padding:40px 0 56px}}
+/* --- 좌측 레일 ---
+   ⚠️ 좁은 화면에서 sticky를 쓰면 안 된다. 1단 배치에서 sticky의 컨테이닝 블록이
+   .shell 그리드 전체(수만 px)가 되어 레일이 화면 상단에 '영구히' 붙어버린다.
+   배경까지 투명하면 본문 글자와 그대로 겹쳐 읽을 수 없게 된다.
+   → 좁을 때는 흐름 안에 두고 높이만 제한한다. sticky는 2단일 때만. */
+.rail{position:static;max-height:42vh;overflow-y:auto;background:var(--bg);
+  padding:22px 0 18px;border-bottom:1px solid var(--line)}
+@media (min-width:1080px){
+  .rail{position:sticky;top:0;align-self:start;max-height:100vh;
+    border-bottom:0;padding:40px 0 56px}
+}
 .rail-head{font-family:var(--mono);font-size:11px;letter-spacing:.15em;
   text-transform:uppercase;color:var(--muted);padding:0 20px 12px;
   border-bottom:1px solid var(--line);margin-bottom:14px}
