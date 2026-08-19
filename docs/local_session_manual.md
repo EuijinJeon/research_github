@@ -31,19 +31,69 @@ GitHub 원격 세션은 egress 프록시 뒤에 있고, **논문 호스트가 �
 
 ---
 
-## 1. 로컬에서 처음 5분
+## 1. 로컬에서 이 문서를 못 찾을 때 ★
 
-```bash
-cd ~/research_github            # 각자 경로
-git fetch origin claude/research-status-check-vpg4bl
-git checkout claude/research-status-check-vpg4bl
-git pull origin claude/research-status-check-vpg4bl
+**이 문서와 `docs/prior_work.md`는 `main`에 없다.**
+`claude/research-status-check-vpg4bl` 브랜치에만 있다.
+로컬에서 `main`을 보고 있으면 파일이 안 보이는 게 정상이다.
 
-# 이 문서와 조사 결과 확인
-less docs/prior_work.md
+원격 상태 (2026-08-19 기준):
+
+```
+origin  https://github.com/EuijinJeon/research_github
+  refs/heads/main                                c70b865   (2026-08-17, 문서 없음)
+  refs/heads/claude/research-status-check-vpg4bl 46198d9   (2026-08-19, 여기 있음)
 ```
 
-환경은 그대로다 (`uv`, Python 3.12, `.venv`). 이 단계에서 새로 설치할 것은 없다.
+### 진단 — 위에서부터 순서대로
+
+```bash
+# (1) 지금 어디에 있나. 레포 안이 맞나?
+git rev-parse --show-toplevel     # 레포 루트 경로. 에러 → 레포 밖에 있음 (2)로
+git branch --show-current         # main 이면 그게 원인. (3)으로
+
+# (2) 레포가 로컬에 없거나 경로를 잊었을 때
+find ~ -maxdepth 4 -type d -name research_github 2>/dev/null
+#   못 찾으면 새로 받는다:
+git clone https://github.com/EuijinJeon/research_github.git
+cd research_github
+
+# (3) 브랜치가 안 보일 때 — 원격 목록을 먼저 갱신한다
+git remote -v                     # origin 이 위 URL 과 같은지 확인
+git fetch origin                  # ← 브랜치 하나가 아니라 전부 받는다
+git branch -r                     # origin/claude/research-status-check-vpg4bl 이 보여야 함
+git switch claude/research-status-check-vpg4bl
+
+# (4) 확인
+ls docs/prior_work.md docs/local_session_manual.md
+git log --oneline -1              # 46198d9 여야 함
+```
+
+> `git fetch origin <브랜치명>` 만 하면 원격추적 참조가 안 생기는 경우가 있어
+> 바로 `checkout`이 실패한다. **`git fetch origin` (인자 없이)** 을 쓸 것.
+
+### 그래도 안 되면
+
+- `git branch -r` 에 아무것도 없다 → `git remote -v` 의 URL 이 위와 다르다.
+  `git remote set-url origin https://github.com/EuijinJeon/research_github.git`
+- 인증을 물어보면 레포가 private 이라서다. `gh auth login` 또는 PAT 로 로그인.
+- **레포 자체를 새로 받는 게 제일 빠를 때가 많다** — 추적되는 건 코드·문서·체크포인트뿐이고
+  `artifacts/regions/`(20M)는 어차피 `extract_regions.py` 로 수십 초면 재생성된다.
+
+### 브랜치 말고 `main`에서 보고 싶다면
+
+작업이 끝났다고 판단되면 병합한다. **먼저 사용자 확인을 받을 것.**
+
+```bash
+git switch main && git pull origin main
+git merge claude/research-status-check-vpg4bl
+git push origin main
+```
+
+### 환경
+
+그대로다 (`uv`, Python 3.12, `.venv`). 이 단계에서 새로 설치할 것은 없다.
+브랜치를 옮겨도 `artifacts/checkpoints/`(추적됨)는 그대로라 재학습이 필요 없다.
 
 ---
 
