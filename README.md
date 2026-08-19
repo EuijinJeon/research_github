@@ -67,6 +67,13 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 | P5 | 영역은 깊이 무관하게 볼록 (784차원 포함) | **위반 0** |
 | P6 | 2층 유닛의 꺾임은 첫 층 직선 위에서만 | **100.00 %** (대조군 대비 15배 분리) |
 
+> ⚠️ **2026-08-19 방향 전환.** 아래 방법 검증은 "비슷한 조각끼리 묶기" 를 전제로 한 것인데,
+> **그 목표 자체가 기각됐습니다** (walkthrough STEP 12). 근거 셋:
+> ① ReLU 전용 — polytope lens 저자들이 직접 적어둔 한계
+> ② MNIST 영역 반경이 최근접이웃 거리의 **0.067배** → `[A_r|b_r]` 가 함수가 아니라 점별 야코비안
+> ③ 인용이 계보 안에서 갈림 — 세기 98 / 귀속 89 vs **병합 20·5·2**
+> **검증 결과 자체는 유효하고, 거기서 배운 방법론은 새 방향에 그대로 씁니다.**
+
 **방법 검증 (4조각 앵커, 손으로 검산됨)**
 
 | | 예측 | 결과 |
@@ -79,13 +86,45 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 > P8이 절반 틀린 것이 오히려 수확이었습니다. **λ의 위험은 greedy의 위험**이고,
 > 이것이 "우리 ε-path는 상계다"라는 서술의 첫 구체적 실례입니다 (STEP 9).
 
+## 3b. 방향 전환 — 무엇을 접고 무엇으로 가는가 (2026-08-19)
+
+| | |
+|---|---|
+| **접는 것** | 영역 병합 / ε-path / MNIST 클러스터링 (D1~D4) |
+| **남기는 것** | STEP 0~5(추출·세기·볼록성 — 건강한 갈래), STEP 6~11의 **검증 방법론**, STEP 12~14 |
+| **가는 곳** | **bilinear MLP** — 가중치만으로 하는 MLP 분해 |
+
+**새 방향:** [Bilinear MLPs enable weight-based mechanistic interpretability](https://arxiv.org/abs/2410.08417)
+(Pearce et al., **ICLR 2025 Spotlight**)
+
+초록이 이 프로젝트와 같은 문제를 겁니다 — *"신경망에서 MLP가 어떻게 계산하는지에 대한
+메커니즘 수준의 이해는 아직 없다. ... MLP는 그동안 해석가능성 연구에서
+**분해 불가능한 부품**으로 취급돼 왔다."*
+
+그리고 위 세 근거를 **전부 무력화합니다**: element-wise 비선형성이 없어 ①이 사라지고,
+고유벡터가 **전역**이라 ②가 사라지며(입력 데이터 자체가 불필요), ③은 Spotlight입니다.
+
+**워크스루와 억지로 잇는 게 아닙니다** — STEP 14가 "깊이가 공짜 분해를 없앤다"의 출구를
+둘로 정리했고, Stage 2(SPD)가 (A)학습, bilinear가 (B)구조 변경입니다.
+
+| | 분해가 나오는가 | 방법 |
+|---|---|---|
+| ReLU 1층 | ✅ 공짜 (항등식) | `base + Σ r_i·c_i` — STEP 13 |
+| ReLU 2층 | ❌ 깨짐 (잔차 0.168) | — STEP 14 |
+| ReLU 2층, 출구 (A) | ✅ 학습으로 | SPD (Stage 2) |
+| **bilinear** | ✅ **공짜 (고유분해)** | 3차 텐서, 데이터 불필요 |
+
 ## 4. 다음에 할 일
 
-[`docs/open_questions.md`](docs/open_questions.md) — 현재 위치, 미결정 D1~D4,
+[`docs/open_questions.md`](docs/open_questions.md) — 현재 위치, **닫힌 항목 D1~D4**,
 겪은 실패 L1~L4, 영감 I1~I4, 열린 질문 Q1~Q4.
 
-[`docs/prior_work.md`](docs/prior_work.md) — **선행연구가 D1~D4에 실제로 뭐라고 답했는지.**
-근거 등급([원문]/[코드]/[요약])을 표기해서, 어디까지 믿어도 되는지 함께 적었다.
+[`docs/prior_work.md`](docs/prior_work.md) — 선행연구 조사 전체.
+근거 등급([원문]/[코드]/[요약])을 표기해서 어디까지 믿어도 되는지 함께 적었다.
+**§12가 방향 전환의 근거, §13이 새 방향이다.**
+
+**바로 다음 작업:** bilinear 층 구현 + MNIST 학습 → 3차 텐서 고유분해 →
+고유벡터가 클래스 구성요소로 읽히는지 → 적대적 예제로 인과 검증.
 
 ---
 

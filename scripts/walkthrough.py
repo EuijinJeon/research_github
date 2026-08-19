@@ -17,9 +17,17 @@ docs/walkthrough_stage1.md 와 짝을 이룬다. 문서를 읽으며 이걸 실�
   STEP 9  절편 가중치 λ 는 자유 손잡이가 아니다 — greedy 를 깨뜨린다
   STEP 10 앵커: 클러스터링 코드가 정답을 복원하는가 (+ 확률적 선택 γ=0.2)
   STEP 11 대조군: 랜덤 배정을 이기는가 (dense/chance 종점)
-  STEP 12 조견표는 'k=1' 이다 — 4조각은 유닛 기여 2개가 만든 것
-  STEP 13 깊이가 합성성을 깨뜨린다 (MNIST 1층 vs 2층) — Stage 2 의 존재 이유
+  ─ 여기서 방향을 튼다 ────────────────────────────────────────────
+  STEP 12 잠깐 — '묶기' 는 애초에 맞는 목표였나 (아니었다. 근거 셋)
+  STEP 13 조견표는 'k=1' 이다 — 4조각은 유닛 기여 2개가 만든 것
+  STEP 14 깊이가 합성성을 깨뜨린다 (MNIST 1층 vs 2층) — Stage 2 의 존재 이유
   그림    artifacts/figures/walkthrough_buildup.png
+
+읽는 순서 안내:
+  STEP 6~11 은 '비슷한 조각끼리 묶는다' 는 **가설을 따라간 기록**이다.
+  그 목표는 STEP 12 에서 기각된다. 그래도 6~11 을 남겨두는 이유는
+  거기서 배운 **검증 방법**(앵커·손잡이·대조군)이 대상이 바뀌어도 그대로 쓰이기 때문이다.
+  결론만 보려면 STEP 12 -> 13 -> 14.
 """
 
 from __future__ import annotations
@@ -828,6 +836,13 @@ def _partitions(items: list[int]):
 def step6() -> None:
     head(6, "조각을 합쳐보기 — 4조각짜리 신경망의 ε-path 전체를 손으로")
 
+    print("  ⚠️ 먼저 알아둘 것: 이 STEP 부터 STEP 11 까지는 **가설을 따라간 기록**이다.")
+    print("     '비슷한 선형함수끼리 묶어 설명을 줄인다' 는 목표는 **STEP 12 에서 기각된다.**")
+    print("     그래도 남겨두는 이유는 두 가지다:")
+    print("       (1) 여기서 배우는 검증 방법(앵커·손잡이·대조군)은 대상이 바뀌어도 그대로 쓴다")
+    print("       (2) 어떻게 기각되는지를 보려면 무엇을 기각하는지 먼저 알아야 한다")
+    print()
+
     legend("K", "\u03a9", "\u03b5", "\u03b5-path", "A_r", "b_r", "centroid")
     model = toy_model()
 
@@ -1587,14 +1602,180 @@ def step11() -> None:
 
 # ================================================================ STEP 12
 #
+# 2026-08-19. STEP 6~11 을 다 만들고 나서 물었어야 할 질문을 늦게 물었다:
+# "비슷한 선형함수끼리 묶는다" 는 목표 자체가 맞는가?
+# 답은 아니오였고, 근거가 셋이다. 이 STEP 은 그 셋을 숫자로 보인다.
+
+
+def _region_radius(model, X, n: int = 60, seed: int = 0) -> torch.Tensor:
+    """데이터 점에서 무작위 방향으로 영역을 벗어날 때까지의 거리.
+
+    영역이 '얼마나 넓은 정의역을 갖는가' 를 재는 가장 단순한 방법이다.
+    이분법 40회면 배정밀도 한계까지 좁혀진다.
+    """
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(X), generator=g)[:n]
+    out = []
+    with torch.no_grad():
+        for i in idx:
+            x0 = X[i : i + 1]
+            p0 = model.activation_pattern(x0)
+            d = torch.randn(1, X.shape[1], generator=g)
+            d = d / d.norm()
+            lo, hi = 0.0, 1.0
+            while hi < 1e4 and (model.activation_pattern(x0 + hi * d) == p0).all():
+                hi *= 2
+            for _ in range(40):
+                mid = (lo + hi) / 2
+                if (model.activation_pattern(x0 + mid * d) == p0).all():
+                    lo = mid
+                else:
+                    hi = mid
+            out.append(lo)
+    return torch.tensor(out), idx
+
+
+def step12() -> None:
+    head(12, "잠깐 — '비슷한 선형함수끼리 묶기' 는 애초에 맞는 목표였나")
+
+    legend("[A_r | b_r]", "A_r", "R", "N", "K")
+    print("  STEP 6~11 에서 우리는 '어떻게 잘 묶을까' 를 여섯 걸음에 걸쳐 파고들었다.")
+    print("  척도를 넷 비교하고, λ 를 조이고, 앵커를 세우고, 대조군을 놓았다.")
+    print("  **그런데 '묶는다는 목표 자체가 맞는가' 는 한 번도 안 물었다.**")
+    print("  늦게 물었더니 답이 아니오였다. 근거가 셋이고, 셋 다 숫자로 나온다.\n")
+
+    # ---------- 근거 1: ReLU 의존 ----------
+    print("  " + "=" * 70)
+    print("  근거 1 — 이 렌즈는 ReLU 밖으로 못 나간다. **저자들이 직접 적어뒀다.**")
+    print()
+    print("    polytope lens (Black et al. 2022) 의 미해결 질문 목록 첫 항목:")
+    print()
+    print("      \"Fuzzy polytope boundaries with other activations — 오늘날 많은 신경망,")
+    print("       특히 대규모 언어모델은 GELU·softmax 같은 매끄러운 활성함수를 쓰는데,")
+    print("       그러면 **폴리토프가 사실 폴리토프가 아니게 된다** — 모서리가 휘거나 뭉개진다.\"")
+    print()
+    print("    트랜스포머로의 확장도 미해결로 남겨뒀다.")
+    print("    즉 조각/폴리토프라는 어휘 전체가 **ReLU 계열 전용**이고,")
+    print("    그 사실이 2022년에 이미 공개돼 있었다.")
+    print()
+
+    # ---------- 근거 2: 조각이 너무 작다 ----------
+    print("  " + "=" * 70)
+    print("  근거 2 — 조각이 작아지면 [A_r|b_r] 는 '함수' 가 아니라 '한 점의 야코비안' 이다.")
+    print()
+    print("    '이 영역에서 신경망은 A_r·x + b_r 로 계산한다' 가 뜻을 가지려면")
+    print("    그 영역이 **뭔가를 담을 만큼 넓어야** 한다. 실제로 재보자:")
+    print("    데이터 점에서 무작위 방향으로 영역을 벗어날 때까지의 거리 vs 최근접이웃 거리.\n")
+
+    rows = []
+    for name, hidden in [("moons", [64]), ("spiral", [64]), ("mnist", [128])]:
+        try:
+            model, _ = load_model(name, hidden, 0, device="cpu")
+            ds = get_dataset(name, seed=0)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [skip] {name}: {type(e).__name__}")
+            continue
+        X = ds.x_train
+        r, idx = _region_radius(model, X)
+        nn = torch.cdist(X[idx], X).topk(2, largest=False).values[:, 1]
+        with torch.no_grad():
+            pat = model.activation_pattern(X)
+        cnt = torch.unique(pat, dim=0, return_counts=True)[1]
+        rows.append((name, hidden, float(r.median()), float(nn.median()),
+                     float(cnt.float().mean())))
+
+    print(f"  {'세팅':>16s} {'영역 반경':>10s} {'최근접이웃':>11s} {'비':>8s} {'영역당 점':>9s}")
+    for name, hidden, rad, nnd, per in rows:
+        print(f"  {name + ' h=' + str(hidden):>16s} {rad:10.4f} {nnd:11.4f} "
+              f"{rad / nnd:7.2f}배 {per:9.1f}")
+    print()
+    twod = [r for r in rows if r[0] != "mnist"]
+    mn = [r for r in rows if r[0] == "mnist"]
+    if twod and mn:
+        lo2 = min(r[2] / r[3] for r in twod)
+        hi2 = max(r[2] / r[3] for r in twod)
+        rm = mn[0][2] / mn[0][3]
+        print("  ★ 2D 와 MNIST 가 **정반대**다.")
+        print(f"    2D: 영역이 데이터 간격보다 {lo2:.1f}~{hi2:.1f}배 넓다"
+              " -> [A_r|b_r] 가 진짜로 이웃을 기술한다.")
+        print(f"    MNIST: 영역이 데이터 간격의 **{rm:.2f}배**(1/{1/rm:.0f}) 다"
+              " -> 영역 안에 자기 점 하나뿐이고")
+        print("           다른 데이터는 **절대 안 들어온다.**")
+        print()
+        print("    즉 MNIST 에서 [A_r|b_r] 는 '영역 위의 선형함수' 가 아니라")
+        print(f"    **그 점 하나에서의 야코비안**이다. {10 * 785:,}개 숫자로 점 하나를 설명하는 셈이고,")
+        print("    **설명이 설명 대상보다 길다.**")
+        print()
+        print("    (표본 60개라 값이 조금 흔들린다. 표본 200개·전체 데이터 기준으로는")
+        print("     MNIST 비가 0.067 이었다 — 어느 쪽이든 결론은 같다.)")
+    print()
+    print("    -> MNIST 영역 클러스터링 = **점별 야코비안 클러스터링**.")
+    print("       I3 에서 '영역 클러스터링 = 데이터 클러스터링' 이라고 완곡하게 적었던 것의")
+    print("       정확한 뜻이 이것이었다. D3(6만 개를 Pruner 로) 은 해석이 안 된다.")
+    print()
+    # ---------- 근거 3: 계보 안에서 갈린다 ----------
+    print("  " + "=" * 70)
+    print("  근거 3 — 인용수가 '영역' 계보 **안에서** 갈린다. 병합만 죽었다.")
+    print()
+    print(f"  {'무엇을 하는 논문인가':>22s} {'논문':>22s} {'연도':>5s} {'인용':>6s}")
+    cite = [
+        ("영역 세기 · 이론", "Hanin & Rolnick", 2019, 98),
+        ("영역별 피처 귀속", "OpenBox", 2018, 89),
+        ("영역 **병합**", "Aletheia", 2020, 20),
+        ("영역 **클러스터링**", "polytope lens", 2022, 5),
+        ("영역 **클러스터링**", "Clustering-Based Interp.", 2021, 2),
+    ]
+    for what, who, yr, c in cite:
+        print(f"  {what:>22s} {who:>22s} {yr:>5d} {c:>6d}")
+    print()
+    print("  (OpenAlex, 2026-08 조회. arXiv DOI 레코드는 출판본과 분리돼 낮게 나오므로")
+    print("   제목 검색으로 정본을 잡았다.)")
+    print()
+    print("  ★ '영역' 이 죽은 게 아니라 **'병합' 이 죽었다.** 4~50배 차이는 잡음이 아니다.")
+    print("    그리고 2024~2026 논문들(AffineLens, Expressivity Saturation, Region Seeding)도")
+    print("    전부 **세기만 하고 병합하지 않는다.**")
+    print()
+
+    # ---------- 그래서 무엇이 남는가 ----------
+    print("  " + "=" * 70)
+    print("  그래서 STEP 6~11 은 버리는가? — **아니다. 무엇이 남는지가 중요하다.**")
+    print()
+    print(f"  {'STEP 6~11 에서 한 것':>26s}  {'목표가 틀렸으니 버림?':>12s}")
+    keep = [
+        ("병합 대상으로서의 조각 클러스터", "버림"),
+        ("거리 척도 네 개 비교", "**남음** — 무엇을 잴지 고르는 문제는 어디에나 있다"),
+        ("λ 같은 손잡이의 경계 찾기", "**남음** — STEP 9 가 보인 '조용히 틀림' 은 일반 현상"),
+        ("앵커(정답 아는 데서 먼저 검증)", "**남음** — 선행연구가 필수로 규정"),
+        ("랜덤 배정 대조군", "**남음** — 곡선 하나는 아무 말도 안 한다"),
+        ("greedy = 상계임을 명시", "**남음** — 알고리즘 탓/모델 탓 구분"),
+        ("비용함수 함정(홑원소 블록)", "**남음** — 대칭·퇴화 케이스 함정"),
+    ]
+    for k, v in keep:
+        print(f"  {k:>26s}  {v}")
+    print()
+    print("  ▶ **틀린 것은 '무엇을 묶을까' 였지 '어떻게 검증할까' 가 아니었다.**")
+    print("    param-decomp 핸드북이 가르치는 것이 정확히 뒤쪽이고, 그건 대상이 바뀌어도 그대로 쓴다.")
+    print()
+    print("  ▶ 그리고 STEP 8~11 은 이미 균열을 보여주고 있었다 — 우리가 못 읽었을 뿐이다:")
+    print("      STEP 8  네 척도 중 둘이 앵커를 통과 못 했다")
+    print("      STEP 9  손잡이를 조금 돌리자 greedy 가 조용히 틀렸다")
+    print("      STEP 11 랜덤 배정 대비 이득이 겨우 1.67배였다")
+    print("    **방법이 대상을 감당 못 한다는 신호가 계속 나오고 있었다.**")
+    print()
+    print("  ▶ 다음 STEP 13~14 가 '그럼 무엇이 이겼나' 를 보인다.")
+    print("    미리 한 줄로: **묶는 게 아니라 쪼개는 것**이었다.")
+
+
+# ================================================================ STEP 13
+#
 # 2026-08-19 문헌 조사 후속. polytope lens 원문이 우리 조견표를 'k=1' 이라 규정하고
 # "decomposable description 을 찾는 데 명백히 최적이 아니다" 라고 적어뒀다.
 # 2026년 MFA 논문이 'k>1' 로 SAE 를 크게 이겼다.
 # 새 결과를 내려는 게 아니라, 왜 그 계열이 이겼는지를 우리 4조각에서 확인한다.
 
 
-def step12() -> None:
-    head(12, "조견표는 'k=1' 이다 — 4조각은 사실 유닛 기여 2개가 만든 것")
+def step13() -> None:
+    head(13, "조견표는 'k=1' 이다 — 4조각은 사실 유닛 기여 2개가 만든 것")
 
     legend("A_r", "b_r", "[A_r | b_r]", "r", "K", "Ω", "ε")
     codes, A, b, X, y, inv = _toy_pieces()
@@ -1695,7 +1876,7 @@ def step12() -> None:
     print()
     print("  ▶ 그리고 이건 APD 의 첫 번째 성질 **faithfulness** 그 자체다:")
     print("    '컴포넌트들의 합이 원본 파라미터를 정확히 복원한다.'")
-    print("    우리는 그걸 학습 없이, 항등식만으로 얻었다. (단, 1층에서만 — STEP 13)")
+    print("    우리는 그걸 학습 없이, 항등식만으로 얻었다. (단, 1층에서만 — STEP 14)")
     print()
     print("  ▶ I4 도 다시 읽힌다. STEP 6 에서 '유닛1이 더 중요하다' 가 나왔는데,")
     print(f"    이제 이유가 눈에 보인다 — c_1 = {fmt(c1)} 이 c_0 = {fmt(c0)} 보다 크다.")
@@ -1705,9 +1886,9 @@ def step12() -> None:
     print("     Ω 는 줄었지만 오라클 호출은 그대로다. Q1 은 k 와 무관한 별개 문제다.")
 
 
-# ================================================================ STEP 13
+# ================================================================ STEP 14
 #
-# STEP 12 의 가법 분해는 1층에서 유도했다. 깊어지면 어떻게 되는가?
+# STEP 13 의 가법 분해는 1층에서 유도했다. 깊어지면 어떻게 되는가?
 # A_r = W3·D2·W2·D1·W1 — r 에 대해 층을 가로질러 '곱' 이 된다. 가법이 아니다.
 # 총 유닛 수를 맞춰 학습해둔 두 MNIST 모델이 이 질문의 대조군으로 이미 준비돼 있다.
 
@@ -1733,12 +1914,12 @@ def _additive_residual(model, patterns: torch.Tensor, m: int = 1500,
     return rel, M.shape[1], P.shape[1], len(P)
 
 
-def step13() -> None:
-    head(13, "깊이가 합성성을 깨뜨린다 — 그리고 그게 SPD 가 존재하는 이유다")
+def step14() -> None:
+    head(14, "깊이가 합성성을 깨뜨린다 — 그리고 그게 SPD 가 존재하는 이유다")
 
     legend("A_r", "b_r", "[A_r | b_r]", "r", "C_out", "Ω", "ε")
 
-    print("  STEP 12 의 가법 분해는 **1층에서** 유도했다. 2층이면 어떻게 되나?")
+    print("  STEP 13 의 가법 분해는 **1층에서** 유도했다. 2층이면 어떻게 되나?")
     print()
     print("      1층:  A_r = W2 · D(r) · W1                 -> D(r) 이 한 번만 들어간다")
     print("      2층:  A_r = W3 · D2(r) · W2 · D1(r) · W1   -> D 가 두 번, 사이에 W2 가 낀다")
@@ -1794,6 +1975,22 @@ def step13() -> None:
     print("    spiral 에서 2층이 1층을 이긴 것(95.5% -> 100%)과 같은 원인일 수 있다:")
     print("    층을 가로지르는 곱이 표현력을 주고, **그 대가로 분해 가능성을 가져간다.**")
     print("    표현력과 해석가능성의 교환이 이 한 줄에 들어 있다.")
+    print()
+    print("  ▶ 출구가 둘 있고, 둘 다 실재하는 연구 갈래다.")
+    print()
+    print("      (A) **분해를 학습한다** — APD -> SPD -> VPD (Stage 2).")
+    print("          활성함수는 그대로 두고, 어떤 파라미터 조각이 함께 쓰이는지를 학습으로 찾는다.")
+    print()
+    print("      (B) **분해가 정확해지도록 활성함수를 바꾼다** — bilinear MLP")
+    print("          (Pearce et al., **ICLR 2025 Spotlight**, arXiv:2410.08417).")
+    print("          element-wise 비선형성을 아예 없애면 MLP 가 3차 텐서로 **완전히** 표현되고,")
+    print("          고유분해가 층의 계산과 **정확히 등가**인 분해를 준다.")
+    print("          데이터 없이 **가중치만으로** 된다 -> STEP 12 의 근거 2(작은 정의역)가 통째로 사라진다.")
+    print("          그리고 GELU/softmax 문제도 없다 -> 근거 1도 사라진다.")
+    print()
+    print("      그 논문 서론이 우리 프로젝트 제목과 같은 문장으로 시작한다:")
+    print("        \"신경망에서 MLP 가 어떻게 계산하는지에 대한 메커니즘 수준의 이해는 아직 없다.")
+    print("         ... MLP 는 그동안 해석가능성 연구에서 **분해 불가능한 부품으로 취급돼 왔다.**\"")
     print()
     print("  ▶ 왜 2D 로는 이 실험을 못 하나 — I3 에 붙는 세 번째 근거")
     print("    moons 의 증강행렬은 C_out×(d+1) = 2×3 = 6 개 숫자뿐이다.")
@@ -1908,6 +2105,7 @@ def main() -> None:
     step11()
     step12()
     step13()
+    step14()
 
     outs = [
         task_figure(models),
