@@ -60,6 +60,9 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 [`docs/open_questions.md`](docs/open_questions.md) — 현재 위치, 미결정 D1~D4,
 겪은 실패 L1~L4, 영감 I1~I4, 열린 질문 Q1~Q4.
 
+[`docs/prior_work.md`](docs/prior_work.md) — **선행연구가 D1~D4에 실제로 뭐라고 답했는지.**
+근거 등급([원문]/[코드]/[요약])을 표기해서, 어디까지 믿어도 되는지 함께 적었다.
+
 ---
 
 ## 나머지 파일은 무엇인가
@@ -67,6 +70,8 @@ uv run python scripts/build_docs.py && xdg-open artifacts/docs_html/walkthrough_
 | | 역할 |
 |---|---|
 | `docs/concepts.md` | 용어 사전 / 정의 모음. **walkthrough를 읽다 막힐 때 찾아보는 용도** |
+| `docs/prior_work.md` | 선행연구가 D1~D4·Q1~Q2에 준 답. 근거 등급 표기 |
+| `docs/local_session_manual.md` | 원격 세션에서 못 읽은 논문을 로컬에서 마저 확인하는 절차 |
 | `src/mlpinterp/` | 재사용 모듈. 핵심은 `models.py`의 `effective_affine` (A_r 계산)과 `regions.py` |
 | `scripts/train.py` | 6개 모델 학습 (2D×2 + MNIST, 각각 1층/2층) |
 | `scripts/extract_regions.py` | 활성 패턴 추출 → `artifacts/regions/` |
@@ -208,9 +213,15 @@ external/      Stage 2에서 클론할 외부 레포 (param-decomp)
 
 ## 선행연구
 
-- Srivastava et al. 2015 — 활성 코드 클러스터링
-- Black et al. 2022 — polytope lens
-- Chu et al. 2018 — PLNN의 국소 선형 분류기
-- Elhage et al. 2022 — Toy Model of Superposition
-- Nanda et al. 2023 — modular addition grokking / 푸리에 회로
-- goodfire-ai/param-decomp — SPD (Stochastic Parameter Decomposition)
+각 문헌이 우리 미결정 사항에 어떤 답을 주는지는 [`docs/prior_work.md`](docs/prior_work.md) 참조.
+
+| 문헌 | 우리에게 주는 것 |
+|---|---|
+| **Sudjianto et al. 2020** — Unwrapping the Black Box of Deep ReLU Networks ([Aletheia](https://github.com/SelfExplainML/Aletheia)) | 영역 병합의 유일한 완성된 구현. `Merger`(agglomerative+kNN 연결성+refit), **`Pruner`(topk core+최근접 → D3의 답)**, `flatten`(→ Q1) |
+| Black et al. 2022 — polytope lens | 폴리토프 유사도 = affine 행렬 차이의 Frobenius norm (D1) |
+| Hanin & Rolnick 2019 — Deep ReLU Nets Have Surprisingly Few Activation Patterns | 직선·평면으로 잘라 영역을 세는 표준 기법 (우리 P5·I1이 이것의 재현) |
+| Srivastava et al. 2015 | 활성 코드 클러스터링 / 데이터 포인트에서 영역 샘플링 |
+| Chu et al. 2018 | PLNN의 국소 선형 분류기 |
+| Elhage et al. 2022 — Toy Model of Superposition | Stage 2 배경 |
+| Nanda et al. 2023 — modular addition grokking | Stage 3 대조군 |
+| **[goodfire-ai/param-decomp](https://github.com/goodfire-ai/param-decomp)** — APD → SPD → VPD | Stage 2 본체. 그리고 **ε 척도(KL/MSE), MDL 클러스터링, 확률적 병합(γ=0.2), "앵커 필수" 규범**의 출처 |
